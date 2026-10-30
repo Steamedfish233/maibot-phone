@@ -40,22 +40,26 @@ if ($rootElement.GetAttribute('orientation', 'http://schemas.android.com/apk/res
 }
 $page = $doc.SelectSingleNode("//*[@android:id='@+id/page_scroll']", $ns)
 $svLog = $doc.SelectSingleNode("//*[@android:id='@+id/sv_log']", $ns)
+$logPanel = $doc.SelectSingleNode("//*[@android:id='@+id/log_panel']", $ns)
 if ($page -eq $null) { Fail 'missing page_scroll' }
 if ($svLog -eq $null) { Fail 'missing sv_log' }
-if ($doc.SelectSingleNode("//*[@android:id='@+id/log_panel']", $ns) -ne $null) {
-    Fail 'separate log_panel should be removed (1.6.x single-page layout)'
-}
+if ($logPanel -eq $null) { Fail 'missing log_panel' }
+# 日志面板必须在页面 ScrollView 之外：嵌进去会形成嵌套纵向滚动，
+# 日志既不能单独滑动，也无法可靠地自动滚到最新一行。
+if ($logPanel.ParentNode -ne $rootElement) { Fail 'log_panel must be a direct child of the root layout' }
 $cursor = $svLog.ParentNode
-$insidePage = $false
 while ($cursor -ne $null) {
-    if ($cursor -eq $page) { $insidePage = $true; break }
+    if ($cursor -eq $page) { Fail 'sv_log must not be nested inside page_scroll' }
     $cursor = $cursor.ParentNode
 }
-if (!$insidePage) { Fail 'sv_log should live inside the single page scroller' }
-Pass 'single-page layout with in-page log'
+if ($page.GetAttribute('layout_height', 'http://schemas.android.com/apk/res/android') -ne '0dp') {
+    Fail 'page_scroll needs weight-based height so the log panel keeps its space'
+}
+Pass 'log panel is separate from the page scroller (no nested scrolling)'
 
 foreach ($id in @('btn_webui', 'btn_napcat_webui', 'btn_webui_check', 'btn_adapter_setup',
-                  'btn_adapter_status', 'btn_napcat_setup', 'btn_github', 'tv_log', 'tv_log_copy', 'tv_log_clear', 'et_qq')) {
+                  'btn_adapter_status', 'btn_napcat_setup', 'btn_github', 'btn_doctor',
+                  'tv_log', 'tv_log_copy', 'tv_log_clear', 'tv_log_toggle', 'et_qq')) {
     if ($doc.SelectSingleNode("//*[@android:id='@+id/$id']", $ns) -eq $null) { Fail "missing control: $id" }
 }
 Pass 'WebUI / adapter / project-link / log controls present'
@@ -81,7 +85,9 @@ foreach ($needle in @(
     'TaskSession.attach',
     'TaskSession.recoverIfNeeded',
     'PROJECT_URL = "https://github.com/Steamedfish233/maibot-phone"',
-    'findViewById<Button>(R.id.btn_github)')) {
+    'findViewById<Button>(R.id.btn_github)',
+    'quickQuery(R.id.btn_doctor, "doctor"',
+    'private fun scrollLogToBottom()')) {
     if (!$main.Contains($needle)) { Fail "MainActivity missing: $needle" }
 }
 foreach ($forbidden in @('MaiBotMobileActivity', 'MaiBotWebUiActivity', 'PluginManagerActivity')) {
@@ -106,9 +112,9 @@ Pass 'installer script verifies WebUI over HTTP and configures the official adap
 
 # 5. version
 $gradle = Read-Text $gradlePath
-if (!$gradle.Contains('versionName = "2.0.1"')) { Fail 'versionName is not 2.0.1' }
-if (!$gradle.Contains('versionCode = 29')) { Fail 'versionCode is not 29' }
-Pass 'version 2.0.1 (29)'
+if (!$gradle.Contains('versionName = "2.0.2"')) { Fail 'versionName is not 2.0.2' }
+if (!$gradle.Contains('versionCode = 30')) { Fail 'versionCode is not 30' }
+Pass 'version 2.0.2 (30)'
 
 # 6. APK metadata when built
 $apk = Join-Path $root 'MaibotApp/app/build/outputs/apk/release/app-release.apk'
@@ -116,8 +122,8 @@ if (Test-Path -LiteralPath $apk) {
     $aapt2 = Join-Path $root 'android-sdk/build-tools/34.0.0/aapt2.exe'
     if (Test-Path -LiteralPath $aapt2) {
         $badging = & $aapt2 dump badging $apk 2>$null | Select-Object -First 1
-        if ($badging -notmatch "versionName='2.0.1'") { Fail "APK versionName mismatch: $badging" }
-        if ($badging -notmatch "versionCode='29'") { Fail "APK versionCode mismatch: $badging" }
+        if ($badging -notmatch "versionName='2.0.2'") { Fail "APK versionName mismatch: $badging" }
+        if ($badging -notmatch "versionCode='30'") { Fail "APK versionCode mismatch: $badging" }
         Pass 'APK version metadata'
     }
 }

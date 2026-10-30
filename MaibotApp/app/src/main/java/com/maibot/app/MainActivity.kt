@@ -17,6 +17,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -43,6 +44,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvLogTitle: TextView
     private lateinit var svLog: ScrollView
     private lateinit var pbLog: ProgressBar
+    private lateinit var logPanel: LinearLayout
+    private lateinit var tvLogToggle: TextView
+    private lateinit var tvLogLatest: TextView
     private lateinit var etQq: EditText
     private lateinit var swKeepAlive: SwitchCompat
     private lateinit var swAutoRestart: SwitchCompat
@@ -61,6 +65,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 只有用户停在日志底部时才自动跟随，避免"正往回看就被拽到底" */
     private var autoScroll = true
+    private var logExpanded = false
+    private var lastRunning = false
 
     private data class PendingRun(
         val action: String,
@@ -83,7 +89,7 @@ class MainActivity : AppCompatActivity() {
             R.id.btn_update, R.id.btn_napcat_install, R.id.btn_napcat_start,
             R.id.btn_napcat_stop, R.id.btn_napcat_setup, R.id.btn_napcat_webui,
             R.id.btn_allstart, R.id.btn_allstop, R.id.btn_webui, R.id.btn_webui_check,
-            R.id.btn_adapter_setup, R.id.btn_adapter_status,
+            R.id.btn_adapter_setup, R.id.btn_adapter_status, R.id.btn_doctor,
             R.id.btn_install_guide, R.id.btn_diagnose, R.id.btn_auto_install,
             R.id.btn_fix_termux, R.id.btn_github
         )
@@ -95,6 +101,13 @@ class MainActivity : AppCompatActivity() {
      */
     private val sessionListener = object : TaskSession.Listener {
         override fun onLogChanged(text: String, running: Boolean, title: String) {
+            val wasRunning = lastRunning
+            lastRunning = running
+            // 任务一开始就展开日志并恢复跟随，否则用户看不到进度。
+            if (running && !wasRunning) {
+                autoScroll = true
+                if (!logExpanded) setLogExpanded(true)
+            }
             renderLog(text, running, title)
             if (running) {
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -123,6 +136,9 @@ class MainActivity : AppCompatActivity() {
         tvLogTitle = findViewById(R.id.tv_log_title)
         svLog = findViewById(R.id.sv_log)
         pbLog = findViewById(R.id.pb_log)
+        logPanel = findViewById(R.id.log_panel)
+        tvLogToggle = findViewById(R.id.tv_log_toggle)
+        tvLogLatest = findViewById(R.id.tv_log_latest)
         etQq = findViewById(R.id.et_qq)
         swKeepAlive = findViewById(R.id.sw_keepalive)
         swAutoRestart = findViewById(R.id.sw_autorestart)
@@ -132,6 +148,8 @@ class MainActivity : AppCompatActivity() {
         bindButtons()
         bindLog()
         askNotificationPermission()
+        // 任务进行中或已有日志时默认展开，否则保持收起、给页面留空间。
+        setLogExpanded(TaskSession.isRunning() || TaskSession.text().isNotBlank())
         refreshStatus()
     }
 
@@ -162,6 +180,14 @@ class MainActivity : AppCompatActivity() {
         svLog.setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
             if (scrollY < oldScrollY) autoScroll = false
             else if (!svLog.canScrollVertically(1)) autoScroll = true
+            updateLatestButton()
+        }
+        tvLogToggle.setOnClickListener { setLogExpanded(!logExpanded) }
+        tvLogTitle.setOnClickListener { setLogExpanded(!logExpanded) }
+        tvLogLatest.setOnClickListener {
+            autoScroll = true
+            svLog.fullScroll(View.FOCUS_DOWN)
+            updateLatestButton()
         }
         findViewById<TextView>(R.id.tv_log_copy).setOnClickListener {
             val log = TaskSession.text()
@@ -180,10 +206,6 @@ class MainActivity : AppCompatActivity() {
             TaskSession.append("__CLEAR__")
             autoScroll = true
         }
-        // 输入 QQ 号时键盘会占掉半屏，收起键盘前先把日志滚到最新。
-        etQq.setOnFocusChangeListener { _, hasFocus ->
-            if (!hasFocus && autoScroll) svLog.post { svLog.fullScroll(View.FOCUS_DOWN) }
-        }
     }
 
     private fun renderLog(text: String, running: Boolean, title: String) {
@@ -192,7 +214,36 @@ class MainActivity : AppCompatActivity() {
         tvLog.contentDescription = title
         pbLog.visibility = if (running) View.VISIBLE else View.GONE
         tvLogTitle.text = if (running) "运行日志 · 进行中" else "运行日志"
-        if (autoScroll) svLog.post { svLog.fullScroll(View.FOCUS_DOWN) }
+        scrollLogToBottom()
+        updateLatestButton()
+    }
+
+    /**
+     * 自动滚到最新一行。
+     *
+     * setText 之后 TextView 还没重新测量，立即 fullScroll 只会滚到"旧的底部"，
+     * 看起来就是日志不跟着走。这里先让布局跑一轮，再滚；再补一次兜底，
+     * 处理长行换行导致高度二次变化的情况。
+     */
+    private fun scrollLogToBottom() {
+        if (!autoScroll) return
+        svLog.post {
+            svLog.fullScroll(View.FOCUS_DOWN)
+            svLog.post { if (autoScroll) svLog.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun updateLatestButton() {
+        tvLogLatest.visibility =
+            if (logExpanded && !autoScroll && svLog.canScrollVertically(1)) View.VISIBLE else View.GONE
+    }
+
+    private fun setLogExpanded(expanded: Boolean) {
+        logExpanded = expanded
+        svLog.visibility = if (expanded) View.VISIBLE else View.GONE
+        tvLogToggle.text = if (expanded) "收起" else "展开"
+        updateLatestButton()
+        if (expanded) scrollLogToBottom()
     }
 
     // ---------------- 保活开关 ----------------
@@ -298,6 +349,7 @@ class MainActivity : AppCompatActivity() {
         quickQuery(R.id.btn_napcat_webui, "napcat-webui", "打开 NapCat WebUI")
         quickQuery(R.id.btn_webui_check, "webui-check", "检测 WebUI 是否可用")
         quickQuery(R.id.btn_adapter_status, "adapter-status", "检测适配器连接状态")
+        quickQuery(R.id.btn_doctor, "doctor", "连接诊断（打不开 WebUI 时先点这个）")
 
         findViewById<Button>(R.id.btn_napcat_setup).setOnClickListener {
             val qq = sanitizeQq(etQq.text.toString())

@@ -6,6 +6,7 @@ App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务�
 
 > v2.0.0 起移除了此前「在 App 内重做 WebUI」的实验方案（原生管理页 / 内嵌 WebView / 内置插件管理），恢复为 1.6.x 的单页布局并重新排版。
 > v2.0.1 把界面上的「联系作者 QQ」换成项目主页入口，问题统一到仓库 Issues。
+> v2.0.2 修复两个严重问题：`screen` 会话名改用精确匹配（此前守护会话 `.maibot-watchdog` 会被误判成 MaiBot 在运行，掩盖真正的故障）；HTTP 检测在没有 `curl` 时改用 `/dev/tcp` 兜底，且只要端口在监听就把地址交给浏览器，不再把可用 WebUI 误判成打不开。日志区从页面里移回独立底部面板，可单独滑动并自动跟随最新一行。
 
 ## 功能
 
@@ -41,7 +42,7 @@ QQ → NapCat → 正向 WebSocket ws://127.0.0.1:3001 → 统一 QQ 连接器 �
 从 [Releases](../../releases) 或 `dist/` 目录下载 APK 安装：
 
 ```
-dist/MaiBot-OneKey-v2.0.1.apk
+dist/MaiBot-OneKey-v2.0.2.apk
 ```
 
 ## 使用步骤

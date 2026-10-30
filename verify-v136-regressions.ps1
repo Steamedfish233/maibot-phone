@@ -29,11 +29,16 @@ foreach ($bad in @('gh-proxy.org','ghfast.top','mirrors.wars.cat')) {
 }
 
 # MaiBot is considered active when either its screen session or port 8001 is live.
-if ($text -notmatch '(?s)is_running\(\)\s*\{\s*screen -ls.*?\|\| maibot_port_open\s*\}') { throw 'is_running must include port 8001 fallback' }
+# The session name must match exactly: a loose "[.]maibot" also hits ".maibot-watchdog",
+# which made a dead MaiBot look alive and hid the real failure.
+if ($text -notmatch '(?s)screen_session_running\(\)\s*\{\s*screen -ls.*?grep -qE "\[\.\]\$\{1\}\[\[:space:\]\]"') { throw 'screen sessions must match the name exactly' }
+if ($text -notmatch '(?s)is_running\(\)\s*\{\s*screen_session_running "\$SCREEN_NAME" \|\| maibot_port_open') { throw 'is_running must use the exact session check plus port 8001 fallback' }
 if ($text -notmatch '(?s)maibot_port_open\(\)\s*\{[^}]*127\.0\.0\.1/8001') { throw 'MaiBot port probe must target loopback 8001' }
-if ($text -notmatch '(?s)napcat_running\(\)\s*\{.*?napcat_port_open 6099.*?napcat_port_open.*NAPCAT_WS_PORT') { throw 'NapCat status must fall back to WebUI and WS ports' }
+if ($text -notmatch '(?s)napcat_running\(\)\s*\{.*?screen_session_running "\$NAPCAT_SCREEN".*?napcat_port_open 6099.*?napcat_port_open.*NAPCAT_WS_PORT') { throw 'NapCat status must fall back to WebUI and WS ports' }
+if ($text -notmatch '(?s)maibot_webui_state\(\)\s*\{.*?maibot_port_open.*?screen_session_running') { throw 'WebUI state must distinguish listening from process-only' }
 if ($text -notmatch 'napcat_webui_port\(\)' -or $text -notmatch 'seq 6099 6199') { throw 'NapCat WebUI must probe the actual port range' }
 if ($text -notmatch 'napcat_log_url\(\)' -or $text -notmatch '6099-6199') { throw 'NapCat WebUI must diagnose missing listener and parse log URL' }
+Write-Host 'PASS: session names match exactly; watchdog can no longer fake a running MaiBot'
 Write-Host 'PASS: MaiBot and NapCat status fall back to local service ports'
 Write-Host 'PASS: NapCat WebUI probes actual port and reports diagnostics'
 if ($text -notmatch 'MaiBot-SnowLuma-Adapter') { throw 'official unified QQ connector guidance missing' }
@@ -57,7 +62,7 @@ info(){ :; }; warn(){ :; }; ok(){ :; }; err(){ :; }; say(){ :; }
 _log(){ :; }
 run_logged(){ "$@" >/dev/null 2>&1; }
 '@
-foreach ($fn in @('apt_busy','apt_wait_unlock','napcat_setup','clone_repo','maibot_port_open','is_running','napcat_port_open','napcat_running')) {
+foreach ($fn in @('apt_busy','apt_wait_unlock','napcat_setup','clone_repo','screen_session_running','maibot_port_open','is_running','napcat_port_open','napcat_running','maibot_webui_state')) {
     # Bound the body by the next top-level function: bodies may contain a column-0 brace (JSON).
     $startMarker = "`n" + $fn + "() {"
     $start = $text.IndexOf($startMarker)

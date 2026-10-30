@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  单页滚动布局：整页一个 ScrollView，日志区放在页面末尾，不再做独立的全屏日志面板。
-  每组功能用 panel_bg 卡片包起来，卡片之间靠 SectionHeader 分隔，保持整洁。
+  页面 ScrollView 与底部运行日志面板必须彼此独立（上下两块）：把日志嵌进页面
+  ScrollView 会形成纵向嵌套滚动，父级会抢走手势，日志既不能单独滑动，也无法
+  可靠地自动滚到最新一行。页面保持整洁，日志面板固定在底部、自己滚动。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
@@ -12,7 +13,8 @@
     <ScrollView
         android:id="@+id/page_scroll"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
         android:fillViewport="true">
 
         <LinearLayout
@@ -277,7 +279,7 @@
             </LinearLayout>
 
             <!-- 安装向导 -->
-            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.1" />
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.2" />
 
             <TextView
                 android:id="@+id/tv_install_guide"
@@ -459,72 +461,16 @@
                     android:text="停止" />
             </LinearLayout>
 
-            <!-- 运行日志 -->
-            <TextView style="@style/SectionHeader" android:text="运行日志" />
+            <!-- 运行日志移到页面下方独立面板：嵌在页面 ScrollView 里会和页面抢手势，
+                 既不能单独滑动，也无法可靠地自动滚到最新一行。 -->
+            <TextView style="@style/SectionHeader" android:text="打不开先点这里" />
 
-            <LinearLayout
+            <Button
+                android:id="@+id/btn_doctor"
+                style="@style/OutlinedBtn"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="@drawable/log_panel_bg"
-                android:orientation="vertical"
-                android:padding="10dp">
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal">
-
-                    <ProgressBar
-                        android:id="@+id/pb_log"
-                        style="?android:attr/progressBarStyleSmall"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginEnd="6dp"
-                        android:indeterminateTint="@color/log_text"
-                        android:visibility="gone" />
-
-                    <TextView
-                        android:id="@+id/tv_log_title"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:ellipsize="end"
-                        android:maxLines="1"
-                        android:text="运行日志"
-                        android:textColor="@color/log_text"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/tv_log_copy"
-                        style="@style/LogAction"
-                        android:text="复制" />
-
-                    <TextView
-                        android:id="@+id/tv_log_clear"
-                        style="@style/LogAction"
-                        android:text="清空" />
-                </LinearLayout>
-
-                <ScrollView
-                    android:id="@+id/sv_log"
-                    android:layout_width="match_parent"
-                    android:layout_height="200dp"
-                    android:layout_marginTop="6dp"
-                    android:scrollbarStyle="insideOverlay">
-
-                    <TextView
-                        android:id="@+id/tv_log"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:fontFamily="monospace"
-                        android:lineSpacingExtra="2dp"
-                        android:text="点上方按钮开始操作，进度会实时显示在这里。"
-                        android:textColor="@color/log_text"
-                        android:textSize="12sp" />
-                </ScrollView>
-            </LinearLayout>
+                android:text="连接诊断（端口 / 进程 / 日志）" />
 
             <!-- 项目主页 -->
             <TextView style="@style/SectionHeader" android:text="项目与反馈" />
@@ -545,4 +491,86 @@
                 android:textSize="11sp" />
         </LinearLayout>
     </ScrollView>
+
+    <!-- 运行日志：独立于页面滚动，固定在底部；拖动日志只滚日志，页面不动 -->
+    <LinearLayout
+        android:id="@+id/log_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@drawable/log_panel_bg"
+        android:orientation="vertical"
+        android:paddingStart="12dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="8dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ProgressBar
+                android:id="@+id/pb_log"
+                style="?android:attr/progressBarStyleSmall"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:indeterminateTint="@color/log_text"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_log_title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="运行日志"
+                android:textColor="@color/log_text"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_log_latest"
+                style="@style/LogAction"
+                android:text="↓ 最新"
+                android:textColor="@color/accent"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tv_log_copy"
+                style="@style/LogAction"
+                android:text="复制" />
+
+            <TextView
+                android:id="@+id/tv_log_clear"
+                style="@style/LogAction"
+                android:text="清空" />
+
+            <TextView
+                android:id="@+id/tv_log_toggle"
+                style="@style/LogAction"
+                android:text="展开" />
+        </LinearLayout>
+
+        <ScrollView
+            android:id="@+id/sv_log"
+            android:layout_width="match_parent"
+            android:layout_height="180dp"
+            android:layout_marginTop="4dp"
+            android:scrollbarStyle="insideOverlay"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tv_log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:lineSpacingExtra="2dp"
+                android:text="点上方按钮开始操作，进度会实时显示在这里。"
+                android:textColor="@color/log_text"
+                android:textSize="12sp" />
+        </ScrollView>
+    </LinearLayout>
 </LinearLayout>

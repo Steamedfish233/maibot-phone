@@ -28,7 +28,7 @@ fi
 LOG="${MAIBOT_LOG:-$STATE_HOME/.maibot-run.log}"
 RUN_TRACKED=1
 case "$RUN_ACTION" in
-  check|status|webui|webui-check|adapter-status|logs|token|napcat-check|napcat-status|napcat-webui|wd|watchdog) RUN_TRACKED=0 ;;
+  check|status|webui|webui-check|doctor|adapter-status|logs|token|napcat-check|napcat-status|napcat-webui|wd|watchdog) RUN_TRACKED=0 ;;
 esac
 [ "${MAIBOT_QUERY:-0}" = 1 ] && RUN_TRACKED=0
 
@@ -629,17 +629,33 @@ NAPCAT_WS_PORT="3001"
 maibot_port_open() {
   (exec 3<>/dev/tcp/127.0.0.1/8001) >/dev/null 2>&1
 }
+# screen 会话名必须精确匹配：否则 ".maibot" 会命中 ".maibot-watchdog"，
+# 让已经崩掉的 MaiBot 看起来"进程还在"，把真正的故障原因掩盖掉。
+screen_session_running() {
+  screen -ls 2>/dev/null | grep -qE "[.]${1}[[:space:]]"
+}
 is_running() {
-  screen -ls 2>/dev/null | grep -q "[.]$SCREEN_NAME" || maibot_port_open
+  screen_session_running "$SCREEN_NAME" || maibot_port_open
 }
 napcat_port_open() {
   local port="$1"
   (exec 3<>"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
 }
 napcat_running() {
-  screen -ls 2>/dev/null | grep -q "[.]$NAPCAT_SCREEN" \
+  screen_session_running "$NAPCAT_SCREEN" \
     || napcat_port_open 6099 \
     || napcat_port_open "$NAPCAT_WS_PORT"
+}
+# WebUI 到底有没有监听，比"进程在不在"更重要：MaiBot 崩了但守护会话还在时，
+# 只有端口能说明 WebUI 是否真的可用。
+maibot_webui_state() {
+  if maibot_port_open; then
+    printf 'running'
+  elif screen_session_running "$SCREEN_NAME"; then
+    printf 'noport'
+  else
+    printf 'stopped'
+  fi
 }
 napcat_webui_port() {
   local p
@@ -905,13 +921,30 @@ status() {
 }
 
 # 端口开着不等于页面能打开：真正发一次 HTTP 请求，避免把打不开的地址丢给浏览器。
+# 容器里可能没有 curl（安装未完成时），此时用 bash 的 /dev/tcp 手工发请求兜底，
+# 否则会永远返回 000，把好好的 WebUI 误判成"打不开"。
 webui_http_code() {
-  local url="$1" code="000"
+  local url="$1" code="000" rest hostport host port path
+  rest="${url#http://}"
+  hostport="${rest%%/*}"
+  if [ "$rest" = "$hostport" ]; then path="/"; else path="/${rest#*/}"; fi
+  host="${hostport%%:*}"
+  port="${hostport##*:}"
   if have curl; then
     # curl 失败时也会打印 000，再叠加兜底就会变成 000000，这里统一成一个值。
     code=$(curl -s -o /dev/null -m 6 -w '%{http_code}' "$url" 2>/dev/null || true)
-    case "$code" in ''|*[!0-9]*) code=000 ;; 000) code=000 ;; esac
+  elif [ -n "$host" ] && [ -n "$port" ]; then
+    code=$( (
+      exec 3<>"/dev/tcp/$host/$port" || exit 1
+      printf 'GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$host" >&3
+      IFS= read -r -t 6 line <&3
+      printf '%s' "$line"
+      exec 3<&- 3>&-
+    ) 2>/dev/null | grep -Eo '[0-9]{3}' | head -1 )
   fi
+  case "$code" in
+    ''|*[!0-9]*) code=000 ;;
+  esac
   printf '%s' "$code"
 }
 webui_http_ok() {
@@ -920,55 +953,123 @@ webui_http_ok() {
   [ -n "$code" ] && [ "$code" != "000" ] && [ "$code" != "404" ]
 }
 
+# 只发一次诊断信息，避免重复请求
+webui_log_tail() {
+  local file="$1" lines="${2:-15}"
+  [ -f "$file" ] || { info "（没有日志文件：$file）"; return 0; }
+  tail -n "$lines" "$file" 2>/dev/null | while IFS= read -r l; do info "$l"; done
+}
+
 webui() {
-  if ! is_running; then
-    warn "MaiBot 未运行，无法打开 WebUI"
-    printf 'WEBUI_UNAVAILABLE=1\n'
-    return 1
-  fi
-  if ! webui_http_ok 'http://127.0.0.1:8001/'; then
-    warn "MaiBot 进程在运行，但 8001 的 WebUI 没有响应（HTTP $(webui_http_code 'http://127.0.0.1:8001/')）"
-    info "可能仍在启动中：等 10~30 秒后再点一次"
-    info "仍打不开请看日志：bash $0 logs"
-    printf 'WEBUI_UNAVAILABLE=1\n'
-    return 1
-  fi
-  ok "MaiBot WebUI 可用：http://127.0.0.1:8001"
-  printf 'WEBUI_URL=%s\n' 'http://127.0.0.1:8001/'
+  local state code
+  state=$(maibot_webui_state)
+  case "$state" in
+    running)
+      code=$(webui_http_code 'http://127.0.0.1:8001/')
+      if [ "$code" = "000" ]; then
+        warn "8001 已监听，但 HTTP 检测没通过（可能还在启动中）"
+        info "仍然把地址交给浏览器；如果页面报错，等 10~30 秒再点一次"
+      else
+        ok "MaiBot WebUI 可用（HTTP $code）"
+      fi
+      info "MaiBot WebUI：http://127.0.0.1:8001"
+      printf 'WEBUI_URL=%s\n' 'http://127.0.0.1:8001/'
+      ;;
+    noport)
+      warn "MaiBot 进程在，但 8001 没有监听：WebUI 没起来"
+      info "常见原因：MaiBot 启动失败、WebUI 被关闭、或还在初始化"
+      webui_log_tail "$LOG_FILE" 15
+      info "可先「停止 MaiBot」再「启动 MaiBot」；仍不行点「连接诊断」"
+      printf 'WEBUI_UNAVAILABLE=1\n'
+      ;;
+    *)
+      warn "MaiBot 未运行：先点「启动 MaiBot」"
+      printf 'WEBUI_UNAVAILABLE=1\n'
+      ;;
+  esac
+  return 0
 }
 
 # 一次性检查两个 WebUI 是否真的能打开（App 的「检测 WebUI」按钮）
 webui_check() {
   say ""
   say "${BOLD}===== WebUI 可用性检测 =====${NC}"
-  local rc=0 code
-  if is_running; then
-    code=$(webui_http_code 'http://127.0.0.1:8001/')
-    if webui_http_ok 'http://127.0.0.1:8001/'; then
-      ok "MaiBot WebUI 可打开（HTTP $code）http://127.0.0.1:8001"
-    else
-      warn "MaiBot 进程在，但 WebUI 无响应（HTTP $code）"
-      rc=1
-    fi
-  else
-    warn "MaiBot 未运行"
-    rc=1
-  fi
-  local p
+  local code p state
+
+  state=$(maibot_webui_state)
+  case "$state" in
+    running)
+      code=$(webui_http_code 'http://127.0.0.1:8001/')
+      if [ "$code" != "000" ]; then
+        ok "MaiBot WebUI 可打开（HTTP $code）http://127.0.0.1:8001"
+      else
+        warn "8001 已监听，但 HTTP 无响应（HTTP $code）"
+        info "多数是还在启动：等 10~30 秒再点一次"
+      fi
+      ;;
+    noport)
+      warn "MaiBot 进程在，但 8001 未监听：WebUI 没有起来"
+      info "先「停止 MaiBot」再「启动 MaiBot」；仍失败看下面的日志"
+      webui_log_tail "$LOG_FILE" 10
+      ;;
+    *)
+      warn "MaiBot 未运行：点「启动 MaiBot」后再检测"
+      ;;
+  esac
+
   p=$(napcat_webui_port 2>/dev/null || true)
   if [ -n "$p" ]; then
     code=$(webui_http_code "http://127.0.0.1:$p/webui")
     if [ "$code" != "000" ]; then
       ok "NapCat WebUI 可打开（HTTP $code，端口 $p）"
     else
-      warn "NapCat 端口 $p 在监听，但 HTTP 无响应"
-      rc=1
+      warn "NapCat 端口 $p 已监听，但 HTTP 无响应（HTTP $code）"
+      info "NapCat 可能还在启动或 QQ 尚未登录"
     fi
+  elif napcat_running; then
+    warn "NapCat 进程在（WS 端口 $NAPCAT_WS_PORT），但 WebUI 未监听（6099-6199）"
+    info "在 App 点「停止 NapCat」再「启动 NapCat」，等扫码界面出现"
+    webui_log_tail "$NAPCAT_LOG" 10
   else
-    warn "NapCat WebUI 未监听（6099-6199 均不可用）"
-    rc=1
+    warn "NapCat 未运行：先「启动 NapCat」并扫码登录 QQ"
   fi
-  return "$rc"
+  return 0
+}
+
+# 打不开时的一次性排查：端口、进程、日志、适配器一起看
+doctor() {
+  say ""
+  say "${BOLD}===== 连接诊断 =====${NC}"
+  have curl && info "curl：可用" || warn "curl：不可用（HTTP 检测已改用 /dev/tcp 兜底）"
+  info "容器内 HOME：$HOME"
+  say ""
+  say "--- MaiBot ---"
+  info "screen 会话 $SCREEN_NAME：$(screen_session_running "$SCREEN_NAME" && echo 有 || echo 无)"
+  info "守护会话 maibot-watchdog：$(screen_session_running maibot-watchdog && echo 有 || echo 无)"
+  info "8001 端口：$(maibot_port_open && echo 已监听 || echo 未监听)"
+  if maibot_port_open; then
+    info "HTTP 状态码：$(webui_http_code 'http://127.0.0.1:8001/')"
+  fi
+  info "日志：${LOG_FILE}"
+  webui_log_tail "$LOG_FILE" 12
+  say ""
+  say "--- NapCat ---"
+  info "screen 会话 $NAPCAT_SCREEN：$(screen_session_running "$NAPCAT_SCREEN" && echo 有 || echo 无)"
+  info "QQ 进程：$(pgrep -f 'qq --no-sandbox' >/dev/null 2>&1 && echo 有 || echo 无)"
+  local open_ports="" p
+  for p in $(seq 6099 6199); do
+    napcat_port_open "$p" && open_ports="$open_ports $p"
+  done
+  [ -n "$open_ports" ] && info "WebUI 端口：$open_ports" || info "WebUI 端口：6099-6199 都没有监听"
+  info "WS 端口 $NAPCAT_WS_PORT：$(napcat_port_open "$NAPCAT_WS_PORT" && echo 已监听 || echo 未监听)"
+  info "日志：${NAPCAT_LOG}"
+  webui_log_tail "$NAPCAT_LOG" 12
+  say ""
+  say "--- 适配器 ---"
+  adapter_status
+  say ""
+  info "结论：MaiBot 需要「8001 已监听」，NapCat 需要「WebUI 端口已监听 + 3001 已监听」"
+  return 0
 }
 
 logs() {
@@ -1266,13 +1367,17 @@ napcat_status() {
 }
 
 napcat_webui() {
-  local port cfg token url log_url
+  local port cfg token url log_url code
   port=$(napcat_webui_port 2>/dev/null || true)
   if [ -z "$port" ]; then
-    warn "NapCat WebUI 未监听（已检查 6099-6199），不能打开链接"
-    info "NapCat 进程状态：$(napcat_running && echo 运行中 || echo 未运行)"
-    tail -n 20 "$NAPCAT_LOG" 2>/dev/null | while IFS= read -r l; do info "$l"; done
-    # 保持查询动作可诊断：输出已知配置地址，但明确标记不可打开。
+    if napcat_running; then
+      warn "NapCat 进程在，但 WebUI 没有监听（已检查 6099-6199）"
+      info "NapCat 可能还没启动完，或者 WebUI 配置没被读取"
+      info "先在 App 点「停止 NapCat」再「启动 NapCat」，等扫码界面出现"
+    else
+      warn "NapCat 未运行：先点「启动 NapCat」并扫码登录 QQ"
+    fi
+    webui_log_tail "$NAPCAT_LOG" 20
     printf 'WEBUI_UNAVAILABLE=1\n'
     return 0
   fi
@@ -1299,15 +1404,14 @@ napcat_webui() {
     url="http://127.0.0.1:$port/webui/"
     warn "未找到 WebUI Token；打开登录页后从 NapCat 日志确认 Token"
   fi
-  local code
   code=$(webui_http_code "http://127.0.0.1:$port/webui")
   if [ "$code" = "000" ]; then
-    warn "NapCat 端口 $port 在监听，但 WebUI 没有返回 HTTP 响应"
-    info "通常是在启动中或登录未完成，等一会儿再点；仍失败请看：$NAPCAT_LOG"
-    printf 'WEBUI_UNAVAILABLE=1\n'
-    return 0
+    # 端口确实在监听，就把地址交出去：可能只是还没准备好，浏览器能给出真实结果。
+    warn "NapCat 端口 $port 已监听，但 HTTP 检测没通过（HTTP $code）"
+    info "通常是在启动中或 QQ 还没登录，等一会儿再点一次"
+  else
+    ok "NapCat WebUI 可用（HTTP $code，端口 $port）"
   fi
-  ok "NapCat WebUI 可用（HTTP $code，端口 $port）"
   info "NapCat WebUI：$url"
   printf 'WEBUI_URL=%s\n' "$url"
 }
@@ -1575,9 +1679,9 @@ menu() {
     say "  --- 服务器模式 ---"
     say "  18)启动全部 19)停止全部"
     say "  --- 连接检查 ---"
-    say "  20)检测WebUI 21)配置适配器 22)适配器状态"
+    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断"
     say "  0)退出"
-    printf '请输入 [0-22]：'
+    printf '请输入 [0-23]：'
     read -r n
     case "$n" in
       1) check;; 2) install;; 3) update;; 4) start;; 5) fg_run;; 6) stop;;
@@ -1585,7 +1689,7 @@ menu() {
       11) napcat_check;; 12) napcat_install;; 13) napcat_setup "${2:-}";; 14) napcat_start;;
       15) napcat_stop;; 16) napcat_status;; 17) napcat_webui;;
       18) allstart;; 19) allstop;;
-      20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;;
+      20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;; 23) doctor;;
       0|q|Q) say "再见"; break;; *) warn "无效输入";;
     esac
   done
@@ -1616,6 +1720,7 @@ case "$RUN_ACTION" in
   napcat-webui)   napcat_webui ;;
   webui)          webui ;;
   webui-check)    webui_check ;;
+  doctor)         doctor ;;
   adapter-setup)  adapter_setup "${2:-}" ;;
   adapter-status) adapter_status ;;
   menu|"")        menu ;;
