@@ -277,7 +277,7 @@
             </LinearLayout>
 
             <!-- 安装向导 -->
-            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.0" />
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.1" />
 
             <TextView
                 android:id="@+id/tv_install_guide"
@@ -526,27 +526,23 @@
                 </ScrollView>
             </LinearLayout>
 
-            <!-- 页脚 -->
-            <LinearLayout
+            <!-- 项目主页 -->
+            <TextView style="@style/SectionHeader" android:text="项目与反馈" />
+
+            <Button
+                android:id="@+id/btn_github"
+                style="@style/OutlinedBtn"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
+                android:text="打开项目 GitHub 主页" />
 
-                <TextView
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="问题反馈 QQ：1131546788（非 MaiBot 官方）"
-                    android:textColor="@color/subtitle"
-                    android:textSize="11sp" />
-
-                <TextView
-                    android:id="@+id/btn_copy_qq"
-                    style="@style/LogAction"
-                    android:text="复制" />
-            </LinearLayout>
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="github.com/Steamedfish233/maibot-phone\n使用问题、建议或 Bug 请在仓库的 Issues 中反馈。本项目不是 MaiBot / NapCat / Termux 官方项目。"
+                android:textColor="@color/subtitle"
+                android:textSize="11sp" />
         </LinearLayout>
     </ScrollView>
 </LinearLayout>

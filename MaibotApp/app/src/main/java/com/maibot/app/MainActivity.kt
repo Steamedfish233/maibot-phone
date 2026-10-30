@@ -71,7 +71,9 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_RUN_COMMAND = 1002
-        private const val OFFICIAL_QQ = "1131546788"
+
+        /** 项目主页：原来的"联系作者 QQ"改成打开仓库，问题走 Issues。 */
+        private const val PROJECT_URL = "https://github.com/Steamedfish233/maibot-phone"
 
         /** 这些动作会下载大量文件，值得提示关闭电池优化 */
         private val LONG_ACTIONS = setOf("setup", "install", "update", "napcat-install")
@@ -83,7 +85,7 @@ class MainActivity : AppCompatActivity() {
             R.id.btn_allstart, R.id.btn_allstop, R.id.btn_webui, R.id.btn_webui_check,
             R.id.btn_adapter_setup, R.id.btn_adapter_status,
             R.id.btn_install_guide, R.id.btn_diagnose, R.id.btn_auto_install,
-            R.id.btn_fix_termux, R.id.btn_copy_qq
+            R.id.btn_fix_termux, R.id.btn_github
         )
     }
 
@@ -261,7 +263,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btn_refresh).setOnClickListener { refreshStatus() }
 
         findViewById<Button>(R.id.btn_fix_termux).setOnClickListener { fixTermuxCommunication() }
-        findViewById<TextView>(R.id.btn_copy_qq).setOnClickListener { copyOfficialQq() }
+        findViewById<Button>(R.id.btn_github).setOnClickListener { openProjectRepo() }
         findViewById<Button>(R.id.btn_install_guide).setOnClickListener { showInstallGuide() }
         findViewById<Button>(R.id.btn_diagnose).setOnClickListener { checkInstallConditions() }
         findViewById<Button>(R.id.btn_auto_install).setOnClickListener {
@@ -393,9 +395,15 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------- 安装与修复 ----------------
 
-    private fun copyOfficialQq() {
-        copyToClipboard(OFFICIAL_QQ, "作者反馈 QQ")
-        toast("已复制作者反馈 QQ：$OFFICIAL_QQ")
+    /** 打开项目主页；没有可用浏览器时退化为复制地址，至少让用户能手动访问。 */
+    private fun openProjectRepo() {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PROJECT_URL)))
+            appendLog("已打开项目主页：$PROJECT_URL")
+        } catch (e: Exception) {
+            copyToClipboard(PROJECT_URL, "项目地址")
+            toast("无法打开浏览器，已复制项目地址")
+        }
     }
 
     private fun showInstallGuide() {

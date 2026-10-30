@@ -5,6 +5,7 @@
 App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务拉起来、把 **MaiBot WebUI** 和 **NapCat WebUI** 用手机浏览器打开，并把 QQ 适配器接到 NapCat 上。
 
 > v2.0.0 起移除了此前「在 App 内重做 WebUI」的实验方案（原生管理页 / 内嵌 WebView / 内置插件管理），恢复为 1.6.x 的单页布局并重新排版。
+> v2.0.1 把界面上的「联系作者 QQ」换成项目主页入口，问题统一到仓库 Issues。
 
 ## 功能
 
@@ -40,7 +41,7 @@ QQ → NapCat → 正向 WebSocket ws://127.0.0.1:3001 → 统一 QQ 连接器 �
 从 [Releases](../../releases) 或 `dist/` 目录下载 APK 安装：
 
 ```
-dist/MaiBot-OneKey-v2.0.0.apk
+dist/MaiBot-OneKey-v2.0.1.apk
 ```
 
 ## 使用步骤

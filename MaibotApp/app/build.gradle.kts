@@ -13,8 +13,8 @@ android {
         applicationId = "com.maibot.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 28
-        versionName = "2.0.0"
+        versionCode = 29
+        versionName = "2.0.1"
     }
 
     // 仓库里不放签名文件和密码（keystore.properties / *.jks 均已 gitignore）。

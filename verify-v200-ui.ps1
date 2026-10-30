@@ -55,12 +55,17 @@ if (!$insidePage) { Fail 'sv_log should live inside the single page scroller' }
 Pass 'single-page layout with in-page log'
 
 foreach ($id in @('btn_webui', 'btn_napcat_webui', 'btn_webui_check', 'btn_adapter_setup',
-                  'btn_adapter_status', 'btn_napcat_setup', 'tv_log', 'tv_log_copy', 'tv_log_clear', 'et_qq')) {
+                  'btn_adapter_status', 'btn_napcat_setup', 'btn_github', 'tv_log', 'tv_log_copy', 'tv_log_clear', 'et_qq')) {
     if ($doc.SelectSingleNode("//*[@android:id='@+id/$id']", $ns) -eq $null) { Fail "missing control: $id" }
 }
+Pass 'WebUI / adapter / project-link / log controls present'
+
+# 联系作者 QQ 已改为项目 GitHub 主页
 $xmlText = Read-Text $layoutPath
+if ($xmlText -match '1131546788') { Fail 'author QQ is still shown in the layout' }
 if ($xmlText -match 'textIsSelectable') { Fail 'textIsSelectable not allowed in the log area' }
-Pass 'WebUI / adapter / log controls present'
+if ($xmlText -notmatch 'Steamedfish233/maibot-phone') { Fail 'layout must show the project repository' }
+Pass 'author QQ replaced by the project repository link'
 
 # 3. MainActivity behaviour
 $main = Read-Text $mainPath
@@ -74,7 +79,9 @@ foreach ($needle in @(
     'WEBUI_URL=',
     'WEBUI_UNAVAILABLE=1',
     'TaskSession.attach',
-    'TaskSession.recoverIfNeeded')) {
+    'TaskSession.recoverIfNeeded',
+    'PROJECT_URL = "https://github.com/Steamedfish233/maibot-phone"',
+    'findViewById<Button>(R.id.btn_github)')) {
     if (!$main.Contains($needle)) { Fail "MainActivity missing: $needle" }
 }
 foreach ($forbidden in @('MaiBotMobileActivity', 'MaiBotWebUiActivity', 'PluginManagerActivity')) {
@@ -99,9 +106,9 @@ Pass 'installer script verifies WebUI over HTTP and configures the official adap
 
 # 5. version
 $gradle = Read-Text $gradlePath
-if (!$gradle.Contains('versionName = "2.0.0"')) { Fail 'versionName is not 2.0.0' }
-if (!$gradle.Contains('versionCode = 28')) { Fail 'versionCode is not 28' }
-Pass 'version 2.0.0 (28)'
+if (!$gradle.Contains('versionName = "2.0.1"')) { Fail 'versionName is not 2.0.1' }
+if (!$gradle.Contains('versionCode = 29')) { Fail 'versionCode is not 29' }
+Pass 'version 2.0.1 (29)'
 
 # 6. APK metadata when built
 $apk = Join-Path $root 'MaibotApp/app/build/outputs/apk/release/app-release.apk'
@@ -109,8 +116,8 @@ if (Test-Path -LiteralPath $apk) {
     $aapt2 = Join-Path $root 'android-sdk/build-tools/34.0.0/aapt2.exe'
     if (Test-Path -LiteralPath $aapt2) {
         $badging = & $aapt2 dump badging $apk 2>$null | Select-Object -First 1
-        if ($badging -notmatch "versionName='2.0.0'") { Fail "APK versionName mismatch: $badging" }
-        if ($badging -notmatch "versionCode='28'") { Fail "APK versionCode mismatch: $badging" }
+        if ($badging -notmatch "versionName='2.0.1'") { Fail "APK versionName mismatch: $badging" }
+        if ($badging -notmatch "versionCode='29'") { Fail "APK versionCode mismatch: $badging" }
         Pass 'APK version metadata'
     }
 }
