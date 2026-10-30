@@ -5,6 +5,18 @@ $source = Join-Path $root 'MaibotApp/app/src/main/assets/maibot-onekey.sh'
 if (!(Test-Path -LiteralPath $source)) { throw "missing file: $source" }
 $text = [System.IO.File]::ReadAllText($source)
 
+# --- static checks: the start path must not rebuild dependencies on every launch ---
+if ($text -notmatch 'uv run --no-sync python bot\.py') {
+    throw 'start must launch with --no-sync so a stuck build cannot block the WebUI'
+}
+if ($text -notmatch '(?s)sync_deps\(\)\s*\{.*?uv sync --frozen.*?uv sync\b') {
+    throw 'sync_deps must try the locked sync first and fall back'
+}
+if ($text -notmatch 'fix-deps\)\s+fix_deps') { throw 'fix-deps action must be routed' }
+if ($text -notmatch 'qq_process_running\(\)') { throw 'NapCat must detect the real QQ process' }
+Write-Host 'PASS: start syncs deps first and launches with --no-sync'
+Write-Host 'PASS: fix-deps action routed; QQ process detection present'
+
 # ASCII-only on purpose: Windows PowerShell reads .ps1 as ANSI when there is no BOM,
 # so non-ASCII text in this file would break parsing.
 $harness = @'
@@ -24,7 +36,8 @@ NAPCAT_WS_PORT=3001
 # not a copy of the logic.
 foreach ($fn in @('screen_session_running','maibot_port_open','is_running','napcat_port_open',
                   'napcat_running','maibot_webui_state','napcat_webui_port','napcat_log_url',
-                  'webui_http_code','webui_http_ok','webui_log_tail','webui','webui_check','napcat_webui')) {
+                  'webui_http_code','webui_http_ok','webui_log_tail','webui','webui_check','napcat_webui',
+                  'adapter_plugin_dir','adapter_status')) {
     $startMarker = "`n" + $fn + "() {"
     $start = $text.IndexOf($startMarker)
     if ($start -lt 0) { throw "function not found: $fn" }
@@ -99,6 +112,28 @@ echo "PASS: NapCat reports unavailable with guidance"
 screen(){ return 1; }
 webui_check >/dev/null 2>&1 || { echo "FAIL: webui_check returned non-zero"; exit 1; }
 echo "PASS: webui_check always exits 0"
+
+# 9) adapter_status must not mistake an inline comment for the QQ account.
+#    MaiBot's bot_config.toml ships with a trailing comment after qq_account.
+BOT_DIR="$work/MaiBot"
+mkdir -p "$BOT_DIR/config"
+printf '%s\n' '[bot]' 'platform = "qq"' 'qq_account = "3980556598" # adapter fallback account' > "$BOT_DIR/config/bot_config.toml"
+NAPCAT_ENV="$work/account"
+printf '%s\n' 'ACCOUNT=3980556598' > "$NAPCAT_ENV"
+napcat_port_open(){ return 1; }
+out=$(adapter_status 2>&1) || true
+echo "$out" | grep -q '3980556598' || { echo "FAIL: qq_account not parsed"; echo "$out"; exit 1; }
+echo "$out" | grep -q 'adapter fallback account' && { echo "FAIL: comment leaked into qq_account"; exit 1; }
+echo "PASS: adapter_status ignores the inline comment on qq_account"
+
+# 10) an empty qq_account must not be replaced by its trailing comment
+printf '%s\n' '[bot]' 'qq_account = "" # adapter fallback account' > "$BOT_DIR/config/bot_config.toml"
+# NapCat side uses a different account so a leaked MaiBot value is distinguishable
+printf '%s\n' 'ACCOUNT=1111111111' > "$NAPCAT_ENV"
+out=$(adapter_status 2>&1) || true
+echo "$out" | grep -q 'adapter fallback account' && { echo "FAIL: comment used as qq_account when empty"; exit 1; }
+echo "$out" | grep -q '3980556598' && { echo "FAIL: stale account still reported as configured"; exit 1; }
+echo "PASS: empty qq_account is not replaced by its comment"
 '@
 
 $temp = Join-Path $env:TEMP ('maibot-webui-status-' + [guid]::NewGuid().ToString('N') + '.sh')

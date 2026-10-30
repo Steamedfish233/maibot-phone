@@ -13,12 +13,13 @@ android {
         applicationId = "com.maibot.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 30
-        versionName = "2.0.2"
+        versionCode = 31
+        versionName = "2.0.3"
     }
 
-    // 仓库里不放签名文件和密码（keystore.properties / *.jks 均已 gitignore）。
-    // 本地放好 maibot.jks + keystore.properties 即自动签名；两者缺一则产出未签名 APK。
+    // The repo ships no keystore and no passwords: *.jks and keystore.properties are gitignored.
+    // Put maibot.jks + keystore.properties next to this module to sign locally; without them
+    // Gradle produces an unsigned release APK instead of failing.
     val keystoreFile = rootProject.file("maibot.jks")
     val keystorePropsFile = rootProject.file("keystore.properties")
     val keystoreProps = Properties().apply {

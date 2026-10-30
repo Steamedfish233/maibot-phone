@@ -279,7 +279,7 @@
             </LinearLayout>
 
             <!-- 安装向导 -->
-            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.2" />
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.3" />
 
             <TextView
                 android:id="@+id/tv_install_guide"
@@ -471,6 +471,14 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="连接诊断（端口 / 进程 / 日志）" />
+
+            <Button
+                android:id="@+id/btn_fix_deps"
+                style="@style/OutlinedBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="修复依赖（MaiBot 卡在 Building 时用）" />
 
             <!-- 项目主页 -->
             <TextView style="@style/SectionHeader" android:text="项目与反馈" />

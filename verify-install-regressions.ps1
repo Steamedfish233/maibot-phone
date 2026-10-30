@@ -7,7 +7,7 @@ RUN_TRACKED=0
 BOLD=; NC=
 err(){ :; }; warn(){ :; }; info(){ :; }; ok(){ :; }; say(){ :; }
 '@
-foreach ($name in @('update','start','logs','sync_napcat_config','napcat_start','allstart')) {
+foreach ($name in @('update','sync_deps','webui_log_tail','start','logs','sync_napcat_config','maibot_port_open','screen_session_running','qq_process_running','napcat_start','allstart')) {
     $match = [regex]::Match($text, '(?ms)^' + $name + '\(\) \{.*?^\}')
     if (!$match.Success) { throw "Function not found: $name" }
     $test += "`n" + $match.Value + "`n"
@@ -18,6 +18,13 @@ trap 'rm -rf "$work"' EXIT
 BOT_DIR="$work/bot"; LOG_FILE="$work/mai.log"; SCREEN_NAME=maibot
 NAPCAT_DIR="$work/napcat"; NAPCAT_ENV="$work/account"; NAPCAT_SCREEN=napcat; NAPCAT_LOG="$work/napcat.log"
 mkdir -p "$BOT_DIR/.git" "$BOT_DIR/data" "$NAPCAT_DIR"
+# uv / run_logged 只用于依赖同步；这里让同步"成功"，好测到后面的启动失败分支
+uv(){ return 0; }
+have(){ return 0; }
+PY_INDEX_URL="https://example.invalid/simple"
+run_logged(){ :; }
+maibot_port_open(){ return 1; }
+screen_session_running(){ return 1; }
 is_running(){ return 0; }
 update && { echo 'FAIL: live update accepted'; exit 1; }
 echo 'PASS: running update rejected'

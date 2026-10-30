@@ -7,6 +7,7 @@ App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务�
 > v2.0.0 起移除了此前「在 App 内重做 WebUI」的实验方案（原生管理页 / 内嵌 WebView / 内置插件管理），恢复为 1.6.x 的单页布局并重新排版。
 > v2.0.1 把界面上的「联系作者 QQ」换成项目主页入口，问题统一到仓库 Issues。
 > v2.0.2 修复两个严重问题：`screen` 会话名改用精确匹配（此前守护会话 `.maibot-watchdog` 会被误判成 MaiBot 在运行，掩盖真正的故障）；HTTP 检测在没有 `curl` 时改用 `/dev/tcp` 兜底，且只要端口在监听就把地址交给浏览器，不再把可用 WebUI 误判成打不开。日志区从页面里移回独立底部面板，可单独滑动并自动跟随最新一行。
+> v2.0.3 解决「MaiBot 会话在、8001 永远不监听」：`start` 先显式 `uv sync` 再用 `uv run --no-sync` 启动（此前 `uv run` 卡在 Building 阶段，日志只剩一行），启动后等待 8001 并在失败时打印日志；新增「修复依赖」按钮。NapCat 启动前确保 Xvfb 在、并区分「会话残留」与「QQ 真在跑」；连接诊断补充虚拟环境、uv、Xvfb 与真实进程列表；修正适配器状态把 `qq_account` 行尾注释当成 QQ 号的解析错误。
 
 ## 功能
 
@@ -42,7 +43,7 @@ QQ → NapCat → 正向 WebSocket ws://127.0.0.1:3001 → 统一 QQ 连接器 �
 从 [Releases](../../releases) 或 `dist/` 目录下载 APK 安装：
 
 ```
-dist/MaiBot-OneKey-v2.0.2.apk
+dist/MaiBot-OneKey-v2.0.3.apk
 ```
 
 ## 使用步骤

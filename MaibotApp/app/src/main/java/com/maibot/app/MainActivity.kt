@@ -89,7 +89,7 @@ class MainActivity : AppCompatActivity() {
             R.id.btn_update, R.id.btn_napcat_install, R.id.btn_napcat_start,
             R.id.btn_napcat_stop, R.id.btn_napcat_setup, R.id.btn_napcat_webui,
             R.id.btn_allstart, R.id.btn_allstop, R.id.btn_webui, R.id.btn_webui_check,
-            R.id.btn_adapter_setup, R.id.btn_adapter_status, R.id.btn_doctor,
+            R.id.btn_adapter_setup, R.id.btn_adapter_status, R.id.btn_doctor, R.id.btn_fix_deps,
             R.id.btn_install_guide, R.id.btn_diagnose, R.id.btn_auto_install,
             R.id.btn_fix_termux, R.id.btn_github
         )
@@ -350,6 +350,7 @@ class MainActivity : AppCompatActivity() {
         quickQuery(R.id.btn_webui_check, "webui-check", "检测 WebUI 是否可用")
         quickQuery(R.id.btn_adapter_status, "adapter-status", "检测适配器连接状态")
         quickQuery(R.id.btn_doctor, "doctor", "连接诊断（打不开 WebUI 时先点这个）")
+        click(R.id.btn_fix_deps, "fix-deps", "修复 MaiBot 依赖（uv sync）")
 
         findViewById<Button>(R.id.btn_napcat_setup).setOnClickListener {
             val qq = sanitizeQq(etQq.text.toString())

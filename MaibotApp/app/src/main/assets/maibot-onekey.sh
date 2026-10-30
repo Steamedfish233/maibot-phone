@@ -881,20 +881,70 @@ update() {
   ok "更新完成，用 start 启动"
 }
 
+# 启动前必须先把依赖同步好。
+# uv run 默认会先构建/安装项目；一旦构建卡住或失败，表现就是
+# "screen 会话在、8001 永远不监听"，日志里只剩 Building maibot @ ...
+sync_deps() {
+  cd "$BOT_DIR" || return 1
+  have uv || { err "找不到 uv：请先执行 install（或点「按顺序安装」）"; return 1; }
+  info "同步依赖（uv sync，首次或网络慢时可能要几分钟）..."
+  if run_logged env UV_INDEX_URL="$PY_INDEX_URL" uv sync --frozen; then
+    ok "依赖已同步（按 uv.lock 锁定版本）"
+    return 0
+  fi
+  warn "uv sync --frozen 失败（锁文件可能过期），改用 uv sync 重试"
+  if run_logged env UV_INDEX_URL="$PY_INDEX_URL" uv sync; then
+    ok "依赖已同步"
+    return 0
+  fi
+  err "依赖同步失败：看上面的输出（多为网络/镜像问题，可重试或换网络）"
+  return 1
+}
+
+# 依赖坏了但不想重装时的修复入口
+fix_deps() {
+  say ""
+  say "${BOLD}===== 修复依赖 =====${NC}"
+  [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
+  if is_running; then
+    info "先停止 MaiBot 再修依赖"
+    stop
+  fi
+  sync_deps || return 1
+  ok "依赖已修复，回到 App 点「启动 MaiBot」"
+}
+
+# 只给出一条命令，便于用户手动确认依赖是否真的卡住
 start() {
   [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
   if [ ! -f "$BOT_DIR/data/webui.json" ]; then
     warn "首次启动需前台确认协议：bash ~/maibot-onekey.sh fg"; return 1
   fi
   is_running && { warn "MaiBot 已在运行"; return 0; }
+  mkdir -p "$BOT_DIR/logs"
+  info "虚拟环境：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失，将由 uv sync 创建)"
+  sync_deps || return 1
   cd "$BOT_DIR" || return 1
-  mkdir -p logs
-  screen -dmS "$SCREEN_NAME" bash -c "uv run python bot.py 2>&1 | tee '$LOG_FILE'"
-  sleep 3
-  if is_running; then
-    ok "MaiBot 后台启动（$SCREEN_NAME）"
+  # --no-sync：依赖刚同步过，启动时不要再触发一次构建，否则又会卡在 Building
+  screen -dmS "$SCREEN_NAME" bash -c "uv run --no-sync python bot.py 2>&1 | tee '$LOG_FILE'"
+  info "等待 WebUI 监听 8001（最多 90 秒）..."
+  local waited=0
+  while [ "$waited" -lt 90 ]; do
+    sleep 1
+    waited=$((waited + 1))
+    maibot_port_open && break
+    screen_session_running "$SCREEN_NAME" || break
+  done
+  if maibot_port_open; then
+    ok "MaiBot 已启动，WebUI http://127.0.0.1:8001"
+  elif screen_session_running "$SCREEN_NAME"; then
+    warn "进程在运行，但 90 秒内 8001 仍未监听"
+    info "最近的日志（若一直停在 Resolved/Building，就是依赖或网络问题）："
+    webui_log_tail "$LOG_FILE" 25
+    info "处理：点「停止 MaiBot」→「修复依赖」→「启动 MaiBot」"
   else
-    err "启动失败，用 fg 看报错"
+    err "启动失败，日志末尾："
+    webui_log_tail "$LOG_FILE" 25
     return 1
   fi
 }
@@ -1047,6 +1097,8 @@ doctor() {
   info "screen 会话 $SCREEN_NAME：$(screen_session_running "$SCREEN_NAME" && echo 有 || echo 无)"
   info "守护会话 maibot-watchdog：$(screen_session_running maibot-watchdog && echo 有 || echo 无)"
   info "8001 端口：$(maibot_port_open && echo 已监听 || echo 未监听)"
+  info "虚拟环境 .venv：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失)"
+  info "uv：$(uv --version 2>/dev/null || echo 不可用)"
   if maibot_port_open; then
     info "HTTP 状态码：$(webui_http_code 'http://127.0.0.1:8001/')"
   fi
@@ -1055,7 +1107,10 @@ doctor() {
   say ""
   say "--- NapCat ---"
   info "screen 会话 $NAPCAT_SCREEN：$(screen_session_running "$NAPCAT_SCREEN" && echo 有 || echo 无)"
-  info "QQ 进程：$(pgrep -f 'qq --no-sandbox' >/dev/null 2>&1 && echo 有 || echo 无)"
+  info "QQ 进程：$(qq_process_running && echo 有 || echo 无)"
+  info "Xvfb 显示 :1：$(pgrep -f 'Xvfb :1' >/dev/null 2>&1 && echo 有 || echo 无)"
+  info "相关进程（最多 6 行）："
+  ps -ef 2>/dev/null | grep -E 'qq|Xvfb|bot\.py' | grep -v grep | head -6 | while IFS= read -r l; do info "$l"; done
   local open_ports="" p
   for p in $(seq 6099 6199); do
     napcat_port_open "$p" && open_ports="$open_ports $p"
@@ -1305,6 +1360,13 @@ EOF
   info "NapCat WebUI：127.0.0.1:6099（随机 Token，仅本机访问）"
 }
 
+# QQ 的进程名/参数在不同版本里不一样，宽松匹配，避免把活着的 QQ 判成"没进程"。
+qq_process_running() {
+  pgrep -f 'QQ/qq' >/dev/null 2>&1 \
+    || pgrep -f 'qq --no-sandbox' >/dev/null 2>&1 \
+    || pgrep -x qq >/dev/null 2>&1
+}
+
 napcat_start() {
   [ -d "$NAPCAT_DIR" ] || { err "NapCat 未装"; return 1; }
   [ -f "$NAPCAT_ENV" ] || { warn "先 napcat-setup <QQ号>"; return 1; }
@@ -1313,42 +1375,50 @@ napcat_start() {
   cat > "$NAPCAT_DIR/start_qq.sh" <<EOF
 #!/usr/bin/env bash
 export DISPLAY=:1
-Xvfb :1 -screen 0 1080x760x16 +extension GLX +render >/dev/null 2>&1 &
-sleep 3
+# 屏幕必须先在，否则 Electron/QQ 起不来（日志会停在 preload 之后）
+if ! pgrep -f "Xvfb :1" >/dev/null 2>&1; then
+  Xvfb :1 -screen 0 1080x760x16 +extension GLX +render >/dev/null 2>&1 &
+  sleep 3
+fi
 cd "$NAPCAT_DIR"
 \$(command -v qq || echo /opt/QQ/qq) --no-sandbox -q "$ACCOUNT" 2>&1 | tee "$NAPCAT_LOG"
 EOF
   chmod +x "$NAPCAT_DIR/start_qq.sh"
+  # 清掉可能残留的旧会话，避免出现"会话在、QQ 早没了"的假象
+  screen -S "$NAPCAT_SCREEN" -X quit >/dev/null 2>&1
   : > "$NAPCAT_LOG" 2>/dev/null || true
   sync_napcat_config
   screen -dmS "$NAPCAT_SCREEN" "$NAPCAT_DIR/start_qq.sh"
   local waited=0 webui_port=""
-  while [ "$waited" -lt 30 ]; do
+  while [ "$waited" -lt 45 ]; do
     sleep 1
     waited=$((waited + 1))
     webui_port=$(napcat_webui_port 2>/dev/null || true)
     [ -n "$webui_port" ] && break
-    if ! screen -ls 2>/dev/null | grep -q "[.]$NAPCAT_SCREEN"; then break; fi
+    # 会话和进程都没了才算真的失败，别因为匹配不到进程名就提前放弃
+    if ! screen_session_running "$NAPCAT_SCREEN" && ! qq_process_running; then
+      break
+    fi
   done
   if [ -n "$webui_port" ]; then
     ok "NapCat 已启动，WebUI 端口：$webui_port"
     info "扫码：bash $0 napcat-webui"
-  elif napcat_running; then
-    warn "NapCat 进程已启动，但 WebUI 尚未监听 6099-6199"
-    info "请执行 bash $0 napcat-webui 查看启动日志"
   else
-    err "启动失败，看 $NAPCAT_LOG"
-    tail -n 20 "$NAPCAT_LOG" 2>/dev/null | while IFS= read -r l; do info "$l"; done
+    err "NapCat 没能起来（WebUI 未监听），日志末尾："
+    webui_log_tail "$NAPCAT_LOG" 25
+    info "排查顺序：① 用「安装 NapCat」重装依赖 ② 确认 /opt/QQ/qq 存在 ③ 把上面的日志发出来"
     return 1
   fi
 }
 
 napcat_stop() {
-  if ! napcat_running && ! pgrep -f "qq --no-sandbox" >/dev/null 2>&1; then
+  if ! napcat_running && ! qq_process_running; then
     warn "NapCat 未运行"; return 0
   fi
   screen -S "$NAPCAT_SCREEN" -X quit >/dev/null 2>&1
+  pkill -f "QQ/qq" 2>/dev/null
   pkill -f "qq --no-sandbox" 2>/dev/null
+  pkill -x qq 2>/dev/null
   pkill -f "Xvfb :1" 2>/dev/null
   ok "NapCat 已停止"
 }
@@ -1582,11 +1652,14 @@ adapter_status() {
     warn "适配器插件：未安装（MaiBot-SnowLuma-Adapter）"
   fi
   if [ -f "$BOT_DIR/config/bot_config.toml" ]; then
-    qq=$(grep -E '^[[:space:]]*qq_account[[:space:]]*=' "$BOT_DIR/config/bot_config.toml" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' "'"'"'')
+    # 必须先去掉行尾注释再取值：模板里 qq_account 后面常跟 "#..." 说明，
+    # 直接取等号右侧会把注释当成 QQ 号（之前就误报成"两边 QQ 号不一致"）。
+    qq=$(grep -E '^[[:space:]]*qq_account[[:space:]]*=' "$BOT_DIR/config/bot_config.toml" 2>/dev/null \
+      | head -1 | cut -d= -f2 | sed 's/#.*//' | tr -d ' "'"'"'')
   fi
-  [ -n "$qq" ] && ok "MaiBot qq_account：$qq" || warn "MaiBot qq_account：未设置"
+  [ -n "$qq" ] && ok "MaiBot qq_account：$qq" || warn "MaiBot qq_account：未设置（点「一键配置适配器」写入）"
   if [ -f "${NAPCAT_ENV:-}" ]; then
-    nap_qq=$(grep -E '^[[:space:]]*ACCOUNT[[:space:]]*=' "$NAPCAT_ENV" 2>/dev/null | cut -d= -f2 | tr -d ' "'"'"'')
+    nap_qq=$(grep -E '^[[:space:]]*ACCOUNT[[:space:]]*=' "$NAPCAT_ENV" 2>/dev/null | cut -d= -f2 | sed 's/#.*//' | tr -d ' "'"'"'')
   fi
   [ -n "$nap_qq" ] && ok "NapCat 登录 QQ：$nap_qq" || warn "NapCat 登录 QQ：未配置"
   if [ -n "$qq" ] && [ -n "$nap_qq" ] && [ "$qq" = "$nap_qq" ]; then
@@ -1679,9 +1752,9 @@ menu() {
     say "  --- 服务器模式 ---"
     say "  18)启动全部 19)停止全部"
     say "  --- 连接检查 ---"
-    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断"
+    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖"
     say "  0)退出"
-    printf '请输入 [0-23]：'
+    printf '请输入 [0-24]：'
     read -r n
     case "$n" in
       1) check;; 2) install;; 3) update;; 4) start;; 5) fg_run;; 6) stop;;
@@ -1689,7 +1762,7 @@ menu() {
       11) napcat_check;; 12) napcat_install;; 13) napcat_setup "${2:-}";; 14) napcat_start;;
       15) napcat_stop;; 16) napcat_status;; 17) napcat_webui;;
       18) allstart;; 19) allstop;;
-      20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;; 23) doctor;;
+      20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;; 23) doctor;; 24) fix_deps;;
       0|q|Q) say "再见"; break;; *) warn "无效输入";;
     esac
   done
@@ -1721,6 +1794,7 @@ case "$RUN_ACTION" in
   webui)          webui ;;
   webui-check)    webui_check ;;
   doctor)         doctor ;;
+  fix-deps)       fix_deps ;;
   adapter-setup)  adapter_setup "${2:-}" ;;
   adapter-status) adapter_status ;;
   menu|"")        menu ;;
