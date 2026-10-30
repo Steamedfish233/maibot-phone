@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Cream tile colour sampled from the official MaiBot mascot artwork. -->
+    <color name="ic_launcher_background">#FDF8EA</color>
+</resources>

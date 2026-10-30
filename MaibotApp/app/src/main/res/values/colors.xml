@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MaiBot OneKey official palette.
+         primary  : OneKey default theme primary oklch(71% .175 52), darkened for white-on-orange text contrast
+         accent   : OneKey brand orange, raw oklch(71% .175 52) = #F37C1A
+         title    : deep ink used by the OneKey interface headings
+         surface  : cream panels on a warm parchment background -->
+    <color name="primary">#C24D24</color>
+    <color name="primary_dark">#9A3A18</color>
+    <color name="on_primary">#FFFBF6</color>
+    <color name="accent">#F37C1A</color>
+    <color name="background">#EFE3CC</color>
+    <color name="surface">#FFFBF3</color>
+    <color name="surface_tint">#F7EDDA</color>
+    <color name="border">#DCCAA9</color>
+    <color name="title">#0A4550</color>
+    <color name="body">#3C4A48</color>
+    <color name="subtitle">#7E8A84</color>
+    <color name="log_bg">#10302F</color>
+    <color name="log_text">#EBD9B7</color>
+    <color name="status_ok">#2E7D5B</color>
+    <color name="status_idle">#9AA6A0</color>
+</resources>

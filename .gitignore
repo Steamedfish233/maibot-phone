@@ -1,0 +1,37 @@
+# Android / Gradle
+.gradle/
+build/
+MaibotApp/build/
+MaibotApp/app/build/
+MaibotApp/.gradle/
+local.properties
+*.iml
+.idea/
+captures/
+.cxx/
+
+# 签名文件与密码（不要提交）
+*.jks
+*.keystore
+keystore.properties
+
+# 本机工具链
+android-sdk/
+gradle-dist/
+gradle-home/
+
+# 构建与临时日志
+*.log
+
+# 测试用临时脚本与假服务
+test-*.sh
+test-funcs.sh
+debug-*.sh
+fake-webui.js
+
+# 旧的源码包（保留 dist/ 下的 APK）
+*.zip
+
+# APK：只保留 dist/ 中的发布包
+*.apk
+!dist/*.apk

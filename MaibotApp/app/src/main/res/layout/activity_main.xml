@@ -1,0 +1,552 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  单页滚动布局：整页一个 ScrollView，日志区放在页面末尾，不再做独立的全屏日志面板。
+  每组功能用 panel_bg 卡片包起来，卡片之间靠 SectionHeader 分隔，保持整洁。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/background"
+    android:orientation="vertical">
+
+    <ScrollView
+        android:id="@+id/page_scroll"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="16dp"
+            android:paddingTop="18dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="28dp">
+
+            <!-- 标题 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingBottom="6dp">
+
+                <ImageView
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:contentDescription="MaiBot"
+                    android:src="@drawable/ic_brand" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="MaiBot 一键部署"
+                        android:textColor="@color/title"
+                        android:textSize="21sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="手机上的 MaiBot + NapCat 控制台"
+                        android:textColor="@color/subtitle"
+                        android:textSize="12sp" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 服务状态 -->
+            <TextView style="@style/SectionHeader" android:text="服务状态" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/panel_bg"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <TextView
+                    android:id="@+id/tv_termux"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:drawableStart="@drawable/status_dot"
+                    android:drawablePadding="10dp"
+                    android:gravity="center_vertical"
+                    android:text="Termux：检测中..."
+                    android:textColor="@color/body"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/tv_maibot"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:drawableStart="@drawable/status_dot"
+                    android:drawablePadding="10dp"
+                    android:gravity="center_vertical"
+                    android:text="MaiBot：检测中..."
+                    android:textColor="@color/body"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/tv_napcat"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:drawableStart="@drawable/status_dot"
+                    android:drawablePadding="10dp"
+                    android:gravity="center_vertical"
+                    android:text="NapCat：检测中..."
+                    android:textColor="@color/body"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/tv_guard"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:drawableStart="@drawable/status_dot"
+                    android:drawablePadding="10dp"
+                    android:gravity="center_vertical"
+                    android:text="守护服务：未开启"
+                    android:textColor="@color/body"
+                    android:textSize="14sp" />
+
+                <Button
+                    android:id="@+id/btn_refresh"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="刷新状态" />
+            </LinearLayout>
+
+            <!-- WebUI 入口：本项目最重要的两个按钮 -->
+            <TextView style="@style/SectionHeader" android:text="网页管理（WebUI）" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/panel_bg"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="用手机浏览器打开。打不开时先点下方「检测 WebUI」，App 会说明是没启动、端口没监听，还是页面还没准备好。"
+                    android:textColor="@color/subtitle"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btn_webui"
+                    style="@style/PrimaryBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="打开 MaiBot WebUI" />
+
+                <Button
+                    android:id="@+id/btn_napcat_webui"
+                    style="@style/PrimaryBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="打开 NapCat WebUI（扫码登录 QQ）" />
+
+                <Button
+                    android:id="@+id/btn_webui_check"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="检测两个 WebUI 是否可用" />
+            </LinearLayout>
+
+            <!-- 适配器 -->
+            <TextView style="@style/SectionHeader" android:text="QQ 适配器（统一 QQ 连接器）" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/panel_bg"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="NapCat 只负责登录 QQ，还需要 MaiBot 的官方适配器把消息转给麦麦。旧的独立 NapCat 适配器已归档，现在用官方「统一 QQ 连接器」。"
+                    android:textColor="@color/body"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="① 打开 MaiBot WebUI → 插件管理 → 从 Git 安装：\nhttps://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter\n② 装完回到这里点「一键配置适配器」\n③ 停止再启动 MaiBot，配置才会生效"
+                    android:textColor="@color/body"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_adapter_setup"
+                    style="@style/PrimaryBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="一键配置适配器（写入本机 3001 连接）" />
+
+                <Button
+                    android:id="@+id/btn_adapter_status"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="检测适配器连接状态" />
+            </LinearLayout>
+
+            <!-- 快捷启动 -->
+            <TextView style="@style/SectionHeader" android:text="快捷启动与保活" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/panel_bg"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <Button
+                    android:id="@+id/btn_allstart"
+                    style="@style/PrimaryBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="一键启动全部（MaiBot + NapCat）" />
+
+                <Button
+                    android:id="@+id/btn_allstop"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="停止全部" />
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/sw_keepalive"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="8dp"
+                    android:text="常驻守护（锁屏也不冻结 CPU）"
+                    android:textColor="@color/body"
+                    android:textSize="13sp" />
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/sw_autorestart"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingBottom="8dp"
+                    android:text="掉线自动重启"
+                    android:textColor="@color/body"
+                    android:textSize="13sp" />
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/sw_autostart"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:paddingBottom="8dp"
+                    android:text="开机自动启动"
+                    android:textColor="@color/body"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_battery"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="关闭电池优化（建议先做）" />
+            </LinearLayout>
+
+            <!-- 安装向导 -->
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.0" />
+
+            <TextView
+                android:id="@+id/tv_install_guide"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="① 安装并首次打开 Termux → ② 授权并开启外部命令 → ③ 检查安装条件 → ④ 安装 Debian 和 MaiBot → ⑤ 确认协议、配置模型与 QQ。安装期间可切到后台或锁屏。"
+                android:textColor="@color/body"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/btn_install_guide"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="开始首次安装向导" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_diagnose"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="检查安装条件" />
+
+                <Space
+                    android:layout_width="8dp"
+                    android:layout_height="1dp" />
+
+                <Button
+                    android:id="@+id/btn_auto_install"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="按顺序安装" />
+            </LinearLayout>
+
+            <!-- 第 0 步 -->
+            <TextView style="@style/SectionHeader" android:text="第 0 步：安装 Termux" />
+
+            <Button
+                android:id="@+id/btn_termux"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="安装 / 打开 Termux" />
+
+            <Button
+                android:id="@+id/btn_fix_termux"
+                style="@style/OutlinedBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="修复 Termux 通信（授权 + 复制命令）" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="首次必须做一次：允许「运行 Termux 命令」权限 → 在 Termux 粘贴执行复制的命令 → 彻底退出 Termux 再打开。"
+                android:textColor="@color/subtitle"
+                android:textSize="12sp" />
+
+            <!-- 第 1 步 -->
+            <TextView style="@style/SectionHeader" android:text="第 1 步：初始化环境" />
+
+            <Button
+                android:id="@+id/btn_setup"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="初始化环境（装 Debian 容器，只需一次）" />
+
+            <!-- 第 2 步 -->
+            <TextView style="@style/SectionHeader" android:text="第 2 步：部署并运行 MaiBot" />
+
+            <Button
+                android:id="@+id/btn_install"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="一键部署 MaiBot（首次分钟级）" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_start"
+                    style="@style/PrimaryBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="启动" />
+
+                <Space
+                    android:layout_width="8dp"
+                    android:layout_height="1dp" />
+
+                <Button
+                    android:id="@+id/btn_stop"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="停止" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btn_update"
+                style="@style/OutlinedBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="更新 MaiBot" />
+
+            <!-- 第 3 步 -->
+            <TextView style="@style/SectionHeader" android:text="第 3 步：部署并运行 NapCat（QQ 协议端）" />
+
+            <EditText
+                android:id="@+id/et_qq"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="机器人 QQ 号（纯数字）"
+                android:importantForAutofill="no"
+                android:inputType="number"
+                android:maxLength="15"
+                android:textColor="@color/body" />
+
+            <Button
+                android:id="@+id/btn_napcat_setup"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="保存 QQ 号（同时预配置正向 WS 3001）" />
+
+            <Button
+                android:id="@+id/btn_napcat_install"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="安装 NapCat（首次下载较久）" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_napcat_start"
+                    style="@style/PrimaryBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="启动" />
+
+                <Space
+                    android:layout_width="8dp"
+                    android:layout_height="1dp" />
+
+                <Button
+                    android:id="@+id/btn_napcat_stop"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="停止" />
+            </LinearLayout>
+
+            <!-- 运行日志 -->
+            <TextView style="@style/SectionHeader" android:text="运行日志" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/log_panel_bg"
+                android:orientation="vertical"
+                android:padding="10dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <ProgressBar
+                        android:id="@+id/pb_log"
+                        style="?android:attr/progressBarStyleSmall"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginEnd="6dp"
+                        android:indeterminateTint="@color/log_text"
+                        android:visibility="gone" />
+
+                    <TextView
+                        android:id="@+id/tv_log_title"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:ellipsize="end"
+                        android:maxLines="1"
+                        android:text="运行日志"
+                        android:textColor="@color/log_text"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tv_log_copy"
+                        style="@style/LogAction"
+                        android:text="复制" />
+
+                    <TextView
+                        android:id="@+id/tv_log_clear"
+                        style="@style/LogAction"
+                        android:text="清空" />
+                </LinearLayout>
+
+                <ScrollView
+                    android:id="@+id/sv_log"
+                    android:layout_width="match_parent"
+                    android:layout_height="200dp"
+                    android:layout_marginTop="6dp"
+                    android:scrollbarStyle="insideOverlay">
+
+                    <TextView
+                        android:id="@+id/tv_log"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:fontFamily="monospace"
+                        android:lineSpacingExtra="2dp"
+                        android:text="点上方按钮开始操作，进度会实时显示在这里。"
+                        android:textColor="@color/log_text"
+                        android:textSize="12sp" />
+                </ScrollView>
+            </LinearLayout>
+
+            <!-- 页脚 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="问题反馈 QQ：1131546788（非 MaiBot 官方）"
+                    android:textColor="@color/subtitle"
+                    android:textSize="11sp" />
+
+                <TextView
+                    android:id="@+id/btn_copy_qq"
+                    style="@style/LogAction"
+                    android:text="复制" />
+            </LinearLayout>
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

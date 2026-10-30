@@ -1,0 +1,1627 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ============================================================
+#  MaiBot 手机一键脚本（单文件自包含版）
+#  - 在 Termux 内运行一次 setup：装容器 + 生成桌面图标
+#  - 之后点桌面图标即可部署/启动/更新 MaiBot 与 NapCat
+#
+#  用法（在 Termux 内）：
+#    bash maibot-onekey.sh setup     首次初始化（只需一次）
+#    bash maibot-onekey.sh menu      进入管理菜单
+#  桌面图标会自动调用：本脚本 + 对应子命令（如 start）
+#
+#  ---- 与 App 的进度通信协议（重要，改动时勿破坏） ----
+#   App 侧 TermuxRunner 会周期性执行一条极短的命令，读取这些文件：
+#     $HOME/.maibot-run.log    带时间戳的运行日志，App 逐行显示为"实时进度"
+#     $HOME/.maibot-last-rc    任务退出码，App 据此判断"真的跑完了"
+#   App 只读取这两个文件，不会干扰正在执行的部署任务。
+# ============================================================
+
+set -u
+
+# ---------- 运行日志（供 App 实时读取，必须早于任何输出） ----------
+RUN_ACTION="${1:-menu}"
+STATE_HOME="${MAIBOT_STATE_HOME:-$HOME}"
+# 容器的 HOME 是 /root；App 的通信文件必须放在绑定的 Termux HOME。
+if [ -z "${PREFIX:-}" ] && [ -z "${MAIBOT_STATE_HOME:-}" ] && [ -d /termux-home ]; then
+  STATE_HOME=/termux-home
+fi
+LOG="${MAIBOT_LOG:-$STATE_HOME/.maibot-run.log}"
+RUN_TRACKED=1
+case "$RUN_ACTION" in
+  check|status|webui|webui-check|adapter-status|logs|token|napcat-check|napcat-status|napcat-webui|wd|watchdog) RUN_TRACKED=0 ;;
+esac
+[ "${MAIBOT_QUERY:-0}" = 1 ] && RUN_TRACKED=0
+
+# 只由最外层任务初始化/结束通信文件；查询和守护进程不能干扰安装任务。
+finish_run() {
+  local rc=$?
+  trap - EXIT
+  {
+    printf 'MAIBOT_EXIT=%s\n' "$rc"
+    printf 'MAIBOT_DONE=1\n'
+    printf 'MAIBOT_ACTION=%s\n' "$RUN_ACTION"
+  } >> "$LOG" 2>/dev/null || true
+  printf '%s\n' "$rc" > "$STATE_HOME/.maibot-last-rc" 2>/dev/null || true
+  rm -f "$STATE_HOME/.maibot-run.pid" 2>/dev/null || true
+  sync 2>/dev/null || true
+  exit "$rc"
+}
+if [ "$RUN_TRACKED" -eq 1 ] && [ "${MAIBOT_NESTED:-0}" != 1 ]; then
+  : > "$LOG" 2>/dev/null || true
+  rm -f "$STATE_HOME/.maibot-last-rc" 2>/dev/null || true
+  echo "$$" > "$STATE_HOME/.maibot-run.pid" 2>/dev/null || true
+  trap finish_run EXIT
+fi
+
+# ---------- 通用工具 ----------
+RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+BLUE=$'\033[34m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+
+# 所有输出同时写日志文件（App 轮询 tail 显示）；进度条用 \r 原地刷新，不写日志
+_ts(){ date '+%H:%M:%S' 2>/dev/null || echo '--:--:--'; }
+_log(){ [ "$RUN_TRACKED" -eq 1 ] || return 0; printf '%s %s\n' "$(_ts)" "$*" >> "$LOG" 2>/dev/null || true; }
+# 仅安装输出管道启用 pipefail，避免全局启用影响 grep -q 等短路管道。
+run_logged() (
+  set -o pipefail
+  "$@" 2>&1 | while IFS= read -r l || [ -n "$l" ]; do _log "$l"; done
+)
+# 与 run_logged 相同，但把输出另存一份，便于失败后判断真实原因（而不是只说"检查网络"）
+run_capture() {
+  local out="$1"; shift
+  ( set -o pipefail; "$@" 2>&1 | tee "$out" | while IFS= read -r l || [ -n "$l" ]; do _log "$l"; done )
+}
+_plain(){ printf '%s\n' "$*"; }
+_plain_log(){ _plain "$*"; _log "$*"; }
+
+say(){  _plain_log "$*"; }
+info(){ printf '%s[信息]%s %s\n' "$BLUE" "$NC" "$*"; _log "[信息] $*"; }
+ok(){   printf '%s[ OK ]%s %s\n' "$GREEN" "$NC" "$*"; _log "[ OK ] $*"; }
+warn(){ printf '%s[注意]%s %s\n' "$YELLOW" "$NC" "$*"; _log "[注意] $*"; }
+err(){  printf '%s[错误]%s %s\n' "$RED" "$NC" "$*"; _log "[错误] $*"; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+# ---------- apt/dpkg 加固 ----------
+# 两个坑必须显式处理，否则后台安装会失败或"看起来卡死"：
+#   1) 用户在 Termux 里同时手动执行 apt → 锁被占用 → 直接失败；
+#   2) dpkg 对 openssl.cnf 等配置文件弹交互式提问 → 无人应答 → 停在 0%。
+# 因此：先等锁释放，并要求 dpkg 在冲突时保留本地版本（不需要人工输入）。
+APT_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=300"
+
+apt_busy() {
+  pgrep -x apt >/dev/null 2>&1 || pgrep -x apt-get >/dev/null 2>&1 || \
+    pgrep -x dpkg >/dev/null 2>&1 || pgrep -x dpkg-deb >/dev/null 2>&1
+}
+
+apt_wait_unlock() {
+  apt_busy || return 0
+  warn "检测到已有 apt/dpkg 正在运行（可能是你在 Termux 里手动升级）"
+  info "等待它结束，最多 5 分钟；请不要在 Termux 里同时执行 apt ..."
+  local waited=0
+  while apt_busy && [ "$waited" -lt 300 ]; do
+    sleep 5
+    waited=$((waited + 5))
+    [ $((waited % 30)) -eq 0 ] && info "仍在等待其它 apt/dpkg 结束（已等 ${waited}s）..."
+  done
+  if apt_busy; then
+    err "其它 apt/dpkg 仍在运行。请在 Termux 里等它彻底结束（或按 Ctrl+C 后再执行 dpkg --configure -a），然后重试。"
+    return 1
+  fi
+  ok "其它 apt/dpkg 已结束，继续"
+  return 0
+}
+
+# 步骤计数：[2/6] 标题
+STEP_NO=0; STEP_ALL=6
+step(){ STEP_NO=$((STEP_NO + 1)); _plain_log ""; _plain_log "===== [${STEP_NO}/${STEP_ALL}] $* ====="; }
+
+# ---------- 网络自检：连不通就直接给出明确原因，避免"跑很久没效果" ----------
+net_check() {
+  info "检查网络连通性 ..."
+  local okcnt=0
+  for u in "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.aliyun.com" "https://www.baidu.com"; do
+    if curl -sI --connect-timeout 8 -o /dev/null "$u"; then
+      okcnt=$((okcnt + 1))
+    fi
+  done
+  if [ "$okcnt" -eq 0 ]; then
+    err "网络不通：无法访问任何镜像站点"
+    err "请检查手机是否联网、是否开了代理/VPN，然后重试"
+    return 1
+  fi
+  ok "网络正常（$okcnt/3 个站点可达）"
+  return 0
+}
+
+# ---------- 带进度条的下载（curl：断点续传 + 国内可达） ----------
+# 用法：dl <输出路径> <URL...>   多个 URL 依次作为备用源
+#
+# 进度显示策略：
+#   curl 自带的 --progress-bar 只写 stdout 且用 \r 原地刷新，App 读日志读不到，
+#   所以这里改成"按秒采样文件大小 + 打印百分比并写日志"，这样：
+#     - Termux 里看着有动态进度条
+#     - App 日志区能看到 百分比 / 已下载大小 / 速度
+dl() {
+  local out="$1"; shift
+  local name; name=$(basename "$out")
+  for url in "$@"; do
+    [ -z "$url" ] && continue
+    info "开始下载：$name"
+    info "下载来源：$url"
+
+    rm -f "$out" 2>/dev/null
+
+    # 后台启动下载，主流程按秒采样进度
+    curl -fL --retry 2 --retry-delay 3 --connect-timeout 20 \
+         --speed-time 60 --speed-limit 1024 \
+         -C - -o "$out" "$url" >/dev/null 2>&1 &
+    local pid=$!
+    local waited=0
+    local last_report=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+
+      # 每 2 秒汇报一次进度
+      if [ $((waited % 2)) -eq 0 ]; then
+        local sz; sz=$(stat -c %s "$out" 2>/dev/null || echo 0)
+        local human; human=$(du -h "$out" 2>/dev/null | cut -f1)
+        local span=$((waited - last_report))
+        [ "$span" -le 0 ] && span=1
+        local speed; speed=$(awk -v s="$sz" -v t="$waited" 'BEGIN{printf "%.0f", (s/1024)/t}' 2>/dev/null || echo 0)
+
+        if [ "$sz" -gt 0 ]; then
+          printf '\r  已下载 %s（约 %s KB/s，用时 %ss）' "${human:-0}" "$speed" "$waited"
+          _log "下载中：$name 已接收 ${human:-0}（约 ${speed} KB/s，用时 ${waited}s）"
+        else
+          printf '\r  正在连接 ... (%ss)' "$waited"
+          _log "下载中：$name 正在连接 ... (${waited}s)"
+        fi
+        last_report=$waited
+      fi
+
+      # 超过 20 分钟仍未完成，视为卡死
+      if [ "$waited" -ge 1200 ]; then
+        warn "下载超时（20 分钟），中止：$name"
+        kill "$pid" 2>/dev/null || true
+        break
+      fi
+    done
+
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    printf '\n'  # 结束进度行
+
+    if [ "$rc" -eq 0 ] && [ -s "$out" ]; then
+      ok "下载完成：$name（$(du -h "$out" 2>/dev/null | cut -f1)）"
+      return 0
+    fi
+
+    warn "该来源失败（超时或网络不通），尝试下一个来源 ..."
+    rm -f "$out" 2>/dev/null
+  done
+  err "全部下载来源均失败，请检查网络后重试"
+  return 1
+}
+
+# ---------- 镜像加速 ----------
+# 每个下载环节都准备多个候选源。实测失效的地址不再使用：
+#   mirrors.wars.cat 的 termux 路径 404、gh-proxy.org 与 ghfast.top 不可达。
+TERMUX_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/termux https://mirror.sjtu.edu.cn/termux https://mirrors.pku.edu.cn/termux"
+TERMUX_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/termux"
+# TUNA HTTPS → Aliyun HTTPS → HTTP mirrors as a last resort. HTTP still uses
+# Debian's signed Release metadata; never disable apt signature verification.
+DEBIAN_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/debian https://mirrors.aliyun.com/debian http://mirrors.aliyun.com/debian http://mirrors.tuna.tsinghua.edu.cn/debian"
+DEBIAN_SEC_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/debian-security https://mirrors.aliyun.com/debian-security http://mirrors.aliyun.com/debian-security http://mirrors.tuna.tsinghua.edu.cn/debian-security"
+DEBIAN_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/debian"
+# GitHub 直连之外的代理（唯一实测可用者；gh-proxy.org / ghfast.top 均已失效）
+GITHUB_PROXY="https://gh-proxy.com/"
+
+# Termux 包源换镜像：直接覆盖 sources.list，兼容新版/旧版格式，避免只 sed 匹配失败。
+write_termux_source() {
+  local mirror="$1" f="$PREFIX/etc/apt/sources.list"
+  mkdir -p "$(dirname "$f")"
+  printf '# MaiBot installer mirror\ndeb %s/apt/termux-main stable main\n' "$mirror" > "$f"
+}
+
+fix_termux_mirror() {
+  [ -z "${PREFIX:-}" ] && return 0
+  local m
+  for m in $TERMUX_MIRRORS; do
+    write_termux_source "$m"
+    info "尝试 Termux 软件源：$m"
+    if run_logged apt-get $APT_OPTS update -y; then
+      ok "Termux 软件源已设置：$m"
+      return 0
+    fi
+    warn "该源不可用，换下一个：$m"
+  done
+  err "所有 Termux 软件源都不可用，请检查网络，或在 Termux 执行 termux-change-repo"
+  return 1
+}
+
+# 容器内 Debian 源换清华镜像
+fix_debian_mirror() {
+  local f=/etc/apt/sources.list code out sf i=0 mirror sec
+  # Preserve repository identity from either legacy or deb822 configuration.
+  code=$( { grep -hoE '(bookworm|bullseye|trixie|forky)' "$f" /etc/apt/sources.list.d/*.sources 2>/dev/null || true; } | head -1)
+  [ -z "$code" ] && code=bookworm
+  mkdir -p /etc/apt/sources.list.d
+  cp -f "$f" "$f.maibot.bak" 2>/dev/null || true
+  for sf in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$sf" ] || continue
+    cp -f "$sf" "$sf.maibot.bak" 2>/dev/null || true
+    mv -f "$sf" "$sf.maibot.disabled" 2>/dev/null || true
+  done
+
+  for mirror in $DEBIAN_MIRRORS; do
+    i=$((i + 1))
+    sec=$(echo "$DEBIAN_SEC_MIRRORS" | cut -d' ' -f"$i")
+    [ -z "$sec" ] && sec="$mirror"
+    cat > "$f" <<EOF
+deb $mirror $code main contrib non-free non-free-firmware
+deb $mirror $code-updates main contrib non-free non-free-firmware
+deb $sec $code-security main contrib non-free non-free-firmware
+EOF
+    info "验证 Debian 软件源：$mirror"
+    # apt-get update can return 0 despite failed fetches when stale lists exist.
+    # Require a successful InRelease fetch and no TLS/certificate/fetch errors.
+    out=$(mktemp) || return 1
+    if apt-get $APT_OPTS update -o Acquire::Retries=0 -o APT::Update::Error-Mode=any >"$out" 2>&1 \
+       && grep -qE '^(Get:|Hit:)[0-9]*[[:space:]]+.*InRelease' "$out" \
+       && ! grep -qiE 'Err:|certificate verify failed|SSL connection failed|Failed to fetch|NO_PUBKEY|EXPKEYSIG|The repository .* is not signed' "$out"; then
+      rm -f "$out"
+      ok "Debian 源验证通过（$code，$mirror）"
+      return 0
+    fi
+    warn "该 Debian 源验证失败，尝试下一个；详情：$(grep -Ei 'Err:|certificate|SSL connection|Failed to fetch|NO_PUBKEY|EXPKEYSIG' "$out" | tail -1)"
+    rm -f "$out"
+  done
+  err "所有 Debian 软件源都未通过签名与 TLS 验证；未关闭证书校验，请检查手机代理/DNS 或网络"
+  return 1
+}
+
+# 统一的 apt 安装（非交互 + 失败明确报错）
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  info "安装系统组件：$*"
+  apt_wait_unlock || return 1
+  if ! run_logged apt-get $APT_OPTS update -y; then
+    err "软件包索引更新失败，请检查网络后重试"
+    return 1
+  fi
+  if ! run_logged apt-get $APT_OPTS install -y --no-install-recommends "$@"; then
+    err "组件安装失败：$*"
+    return 1
+  fi
+  ok "组件就绪：$*"
+  return 0
+}
+
+# ============================================================
+#  Termux 层：检测到 $PREFIX 说明在 Termux（非容器）里运行
+# ============================================================
+if [ -n "${PREFIX:-}" ]; then
+
+  termux_setup() {
+    STEP_ALL=6
+    step "环境初始化（Termux 层）"
+
+    # 1. 脚本自就位
+    local self
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    if [ "$self" != "$HOME/maibot-onekey.sh" ]; then
+      cp "$self" "$HOME/maibot-onekey.sh"
+      chmod +x "$HOME/maibot-onekey.sh"
+    fi
+    ok "脚本已就位：$HOME/maibot-onekey.sh"
+
+    # 2. 先换国内源并完整升级，修复 curl/libcurl/openssl 半更新状态
+    step "切换国内软件源并修复 Termux 包环境"
+    # 若你正在 Termux 里手动 apt，这里先等它结束，避免抢锁失败
+    apt_wait_unlock || return 1
+    if ! fix_termux_mirror; then return 1; fi
+    export DEBIAN_FRONTEND=noninteractive
+    if ! run_logged apt-get $APT_OPTS full-upgrade -y; then
+      err "Termux 基础库升级失败。请确认没有在 Termux 里同时手动执行 apt；"
+      err "修复配置冲突可执行：dpkg --configure -a  然后重试"
+      return 1
+    fi
+    step "安装 Termux 基础组件"
+    if ! run_logged apt-get $APT_OPTS install -y proot-distro screen termux-tools curl; then
+      err "基础组件安装失败，请检查网络后重试（常见原因：未换镜像源 / 无网络）"
+      return 1
+    fi
+    have proot-distro || { err "proot-distro 未装上，终止"; return 1; }
+    ok "proot-distro / screen / termux-tools 就绪"
+
+    # 3. 允许外部 App（本 APK）调用 Termux，否则点按钮没反应
+    mkdir -p "$HOME/.termux"
+    touch "$HOME/.termux/termux.properties"
+    if grep -q '^[[:space:]]*#\?[[:space:]]*allow-external-apps' "$HOME/.termux/termux.properties"; then
+      sed -i 's/^[[:space:]]*#\?[[:space:]]*allow-external-apps.*/allow-external-apps=true/' "$HOME/.termux/termux.properties"
+    else
+      echo 'allow-external-apps=true' >> "$HOME/.termux/termux.properties"
+    fi
+    ok "已开启 allow-external-apps（本 App 可调用 Termux）"
+
+    # 4. 唤醒锁：锁屏后不冻结 CPU（服务器模式关键）
+    if have termux-wake-lock; then
+      termux-wake-lock && ok "已获取 Termux 唤醒锁"
+    else
+      warn "未找到 termux-wake-lock（可执行 pkg install termux-tools）"
+    fi
+
+    # 5. 建 Debian 容器（带进度）
+    step "创建 Debian 容器（优先国内镜像仓库，rootfs 约 47MB）"
+    # list 会列出可安装发行版，空/残缺 rootfs 也不代表已安装。
+    # 兼容新旧布局，并实际登录验证 Debian 的 shell 可运行。
+    debian_ready() {
+      local rootfs found=0
+      for rootfs in "$PREFIX/var/lib/proot-distro/containers/debian/rootfs" \
+                    "$PREFIX/var/lib/proot-distro/installed-rootfs/debian"; do
+        if [ -s "$rootfs/etc/debian_version" ]; then
+          found=1
+          break
+        fi
+      done
+      [ "$found" -eq 1 ] || return 1
+      proot-distro login debian -- /bin/bash -c \
+        'test -s /etc/debian_version && test -x /bin/bash' >/dev/null 2>&1
+    }
+    # proot-distro 5.x 改为从容器镜像仓库拉取 rootfs（默认 registry-1.docker.io），
+    # 该地址在国内经常直接超时。refs.py 支持 "主机/仓库:标签" 形式，
+    # 因此这里优先走国内镜像仓库，最后才回退官方源。
+    # 已实测：docker.m.daocloud.io 能完整提供 library/debian 的 arm64 层（约 47MB）。
+    registry_alive() {
+      local code
+      code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 12 \
+             "https://$1/v2/" 2>/dev/null || echo 000)
+      [ "$code" = "401" ] || [ "$code" = "200" ]
+    }
+
+    # 从国内镜像站（ISCAS）解析一个"确实包含 rootfs.tar.xz"的日期目录。
+    # 该镜像按日期分目录，最新目录常常还没同步到文件（空目录），因此必须逐个验证。
+    iscas_rootfs_url() {
+      local arch=arm64
+      [ "$(uname -m)" = "x86_64" ] && arch=amd64
+      local base="https://mirror.iscas.ac.cn/lxc-images/images/debian/bookworm/$arch/default"
+      local listing d url
+      listing=$(curl -s --connect-timeout 12 --max-time 25 "$base/" 2>/dev/null || true)
+      [ -n "$listing" ] || return 1
+      for d in $(printf '%s' "$listing" \
+                 | grep -oE 'href="[0-9]{8}_[0-9]{2}(%3A|:)[0-9]{2}/"' \
+                 | sed 's/href="//; s/"$//' | sort -r | head -6); do
+        url="${base}/${d}rootfs.tar.xz"
+        if [ "$(curl -sI -o /dev/null -w '%{http_code}' --connect-timeout 12 --max-time 25 "$url" 2>/dev/null)" = "200" ]; then
+          printf '%s\n' "$url"
+          return 0
+        fi
+      done
+      return 1
+    }
+
+    install_debian_image() {
+      local dlog="$HOME/.maibot-debian-install.log"
+      local ref host
+      # 依次尝试：daocloud（实测可完整提供 arm64 层）→ 1ms（同样实测可用）
+      # → 官方 Docker Hub（部分网络可用）
+      for ref in "docker.m.daocloud.io/library/debian" "docker.1ms.run/library/debian" "debian"; do
+        host="${ref%%/*}"
+        if [ "$host" != "$ref" ]; then
+          if registry_alive "$host"; then
+            ok "镜像仓库可用：$host"
+          else
+            warn "镜像仓库不可达，跳过：$host"
+            continue
+          fi
+        fi
+        info "拉取 Debian 镜像：$ref"
+        if run_capture "$dlog" proot-distro install "$ref"; then
+          ok "Debian 容器创建完成（来源：$ref）"
+          return 0
+        fi
+        warn "该来源失败：$ref"
+        # 清掉半成品，否则下次会被误判成"已安装"而跳过
+        proot-distro remove debian >/dev/null 2>&1 || true
+      done
+
+      # 最后兜底：容器镜像仓库全不可用时，直接从国内镜像站导入 rootfs 压缩包。
+      # 注意：这种方式不带 manifest.json，reset/run 子命令不可用（本脚本只用 login，不受影响）。
+      local tarball=""
+      if tarball=$(iscas_rootfs_url); then
+        info "容器仓库均不可用，改用国内镜像站的 rootfs：$tarball"
+        if run_capture "$dlog" proot-distro install "$tarball" --name debian; then
+          ok "Debian 容器创建完成（来源：国内 rootfs 镜像站）"
+          return 0
+        fi
+        warn "国内 rootfs 导入失败"
+        proot-distro remove debian >/dev/null 2>&1 || true
+      else
+        warn "未能从国内镜像站解析到可用的 rootfs 压缩包"
+      fi
+
+      if grep -qiE 'timed out|timeout|cannot connect|connection refused|Errno 110|Errno 111|Temporary failure|network is unreachable' "$dlog" 2>/dev/null; then
+        err "所有下载来源都连不上（这是网络可达性问题，不是你 Termux 配置错误）"
+        info "可在 Termux 里手动重试，观察具体报错："
+        info "    proot-distro install docker.m.daocloud.io/library/debian"
+        info "若仍超时，请更换网络或使用代理后重试。"
+      else
+        err "Debian 容器创建失败：$(tail -n 3 "$dlog" 2>/dev/null | tr '\n' ' ')"
+      fi
+      info "完整报错见：$dlog"
+      return 1
+    }
+
+    if debian_ready; then
+      ok "Debian 容器已存在，跳过"
+    else
+      if ! install_debian_image; then return 1; fi
+    fi
+    if ! debian_ready; then
+      err "Debian 容器安装后仍检测不到，请重试；也可在 Termux 里手动执行：proot-distro install debian"
+      return 1
+    fi
+
+    # 6. 生成桌面图标脚本
+    step "生成桌面快捷操作图标"
+    mkdir -p "$HOME/.shortcuts"
+    gen() {
+      local label="$1" sub="$2" mode="$3"
+      local f="$HOME/.shortcuts/$label.sh"
+      if [ "$mode" = "live" ]; then
+        printf '#!/data/data/com.termux/files/usr/bin/bash\nexec bash "$HOME/maibot-onekey.sh" %s\n' "$sub" > "$f"
+      else
+        {
+          printf '#!/data/data/com.termux/files/usr/bin/bash\n'
+          printf 'bash "$HOME/maibot-onekey.sh" %s\n' "$sub"
+          printf 'echo ""\nread -r -p "[完成] 按回车关闭本窗口 " _\n'
+        } > "$f"
+      fi
+      chmod +x "$f"
+    }
+
+    gen "一键部署MaiBot" "install"        "cmd"
+    gen "启动全部服务"   "guard"          "cmd"
+    gen "停止全部服务"   "guard-stop"     "cmd"
+    gen "启动MaiBot"     "start"          "cmd"
+    gen "前台启动MaiBot" "fg"             "live"
+    gen "停止MaiBot"     "stop"           "cmd"
+    gen "更新MaiBot"     "update"         "cmd"
+    gen "MaiBot状态"     "status"         "cmd"
+    gen "查看密钥"       "token"          "cmd"
+    gen "MaiBot菜单"     ""               "live"
+    gen "安装NapCat"     "napcat-install" "cmd"
+    gen "配置QQ号"       "napcat-setup"   "live"
+    gen "启动NapCat"     "napcat-start"   "cmd"
+    gen "停止NapCat"     "napcat-stop"    "cmd"
+    gen "NapCat登录码"   "napcat-webui"   "cmd"
+
+    say ""
+    ok "已生成 $(ls "$HOME/.shortcuts" | wc -l) 个桌面图标脚本（~/.shortcuts/）"
+    say ""
+    say "===== 后续步骤（只需一次）====="
+    say " 1) 安装 Termux:Widget 插件："
+    say "    https://github.com/termux/termux-widget/releases 下 APK 安装"
+    say " 2) 主屏幕长按 → 添加小部件 → Termux:Widget → 拖到桌面"
+    say " 3) 点桌面图标即可一键操作"
+    say ""
+    say "推荐首次流程：一键部署MaiBot → 前台启动MaiBot(确认协议) → 启动MaiBot"
+    say "            → 安装NapCat → 配置QQ号 → 启动NapCat → NapCat登录码(扫码)"
+    say "            → 最后执行「启动全部服务」进入 7×24 服务器模式"
+    say ""
+    ok "初始化完成！"
+  }
+
+  # ---------- Termux 层守护：唤醒锁 + 独立 screen 会话 ----------
+  termux_guard() {
+    local sub="$1"
+    case "$sub" in
+      guard-stop)
+        screen -S maibot-watchdog -X quit >/dev/null 2>&1
+        have termux-wake-lock && termux-wake-unlock >/dev/null 2>&1
+        local rc=0
+        proot-distro login debian --bind "$HOME:/termux-home" \
+          -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+          MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" bash /termux-home/maibot-onekey.sh allstop || rc=1
+        if [ "$rc" -ne 0 ]; then
+          err "停止服务时有步骤失败，请查看上方输出"
+          return 1
+        fi
+        ok "已停止全部服务与守护"
+        return 0
+        ;;
+    esac
+
+    if ! have proot-distro; then
+      err "环境未初始化，请先运行：bash ~/maibot-onekey.sh setup"
+      return 1
+    fi
+
+    # 1) 唤醒锁：锁屏后 CPU 不被冻结
+    if have termux-wake-lock; then
+      termux-wake-lock >/dev/null 2>&1 && ok "Termux 唤醒锁已获取（锁屏不冻结）"
+    fi
+
+    # 2) 拉起容器内全部服务（幂等）
+    info "启动 MaiBot 与 NapCat ..."
+    local start_rc=0
+    proot-distro login debian --bind "$HOME:/termux-home" \
+      -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+          MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" bash /termux-home/maibot-onekey.sh allstart || start_rc=1
+
+    # 3) 独立守护会话：即使本 App 被杀，容器内也会自我恢复
+    if have screen; then
+      if screen -ls 2>/dev/null | grep -q "[.]maibot-watchdog"; then
+        ok "守护进程已在运行"
+      else
+        screen -dmS maibot-watchdog bash "$HOME/maibot-onekey.sh" wd
+        sleep 2
+        screen -ls 2>/dev/null | grep -q "[.]maibot-watchdog" \
+          && ok "守护进程已启动（掉线自动拉起）" || warn "守护进程启动失败"
+      fi
+    else
+      warn "未安装 screen，跳过守护进程（可执行 pkg install screen）"
+    fi
+
+    if [ "$start_rc" -ne 0 ]; then
+      say ""
+      err "服务未能全部启动（守护已就绪）。请查看上方 [错误] 行处理后重试。"
+      return 1
+    fi
+
+    say ""
+    ok "服务器模式已开启：只要手机有电，MaiBot 就会持续运行"
+    info "关闭请执行：bash $0 guard-stop"
+    return 0
+  }
+
+  _LAYER_RC=0
+  if [ "${1:-menu}" = "setup" ]; then
+    termux_setup; _LAYER_RC=$?
+  elif [ "${1:-}" = "guard" ] || [ "${1:-}" = "guard-stop" ] || [ "${1:-}" = "wake" ]; then
+    termux_guard "${1:-}"; _LAYER_RC=$?
+  else
+    # 非 setup 命令：进容器执行同一脚本同一子命令
+    if ! have proot-distro; then
+      err "未安装 proot-distro，请先运行：bash ~/maibot-onekey.sh setup"
+      exit 1
+    fi
+    proot-distro login debian --bind "$HOME:/termux-home" -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+          MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" bash /termux-home/maibot-onekey.sh "$@"
+    _LAYER_RC=$?
+  fi
+  # 把真实退出码交给 App：App 用它判断"这次初始化/操作到底成功没有"
+  exit "$_LAYER_RC"
+fi
+
+# ============================================================
+#  容器层：以下在 Debian 容器内执行
+# ============================================================
+
+export PATH="$HOME/.local/bin:$PATH"
+
+# 万一仍需要下载 Python 解释器，让 uv 走 GitHub 代理而不是直连 GitHub
+# （正常情况下 UV_PYTHON_DOWNLOADS=never 已禁止下载，这里只是保险）
+export UV_PYTHON_INSTALL_MIRROR="${GITHUB_PROXY}https://github.com/astral-sh/python-build-standalone/releases/download"
+
+# ---------- MaiBot 配置 ----------
+REPO="https://github.com/Mai-with-u/MaiBot.git"
+# gh-proxy.org 已实测不可达，改用 gh-proxy.com
+REPO_MIRROR="${GITHUB_PROXY}https://github.com/Mai-with-u/MaiBot.git"
+BASE_DIR="${MAIBOT_HOME:-$HOME/maimai}"
+BOT_DIR="$BASE_DIR/MaiBot"
+PY_INDEX_URL="${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
+SCREEN_NAME="maibot"
+LOG_FILE="$BOT_DIR/logs/mai.log"
+
+# ---------- NapCat 配置 ----------
+NAPCAT_DIR="$HOME/NapCat.linux.arm64"
+NAPCAT_SCREEN="napcat"
+NAPCAT_LOG="$HOME/napcat.log"
+NAPCAT_ENV="$HOME/.env"
+LINUXQQ_URL="https://dldir1v6.qq.com/qqfile/qq/QQNT/Linux/QQ_3.2.18_250626_arm64_01.deb"
+NAPCAT_FALLBACK_VERSION="v4.18.28"
+NAPCAT_WS_PORT="3001"
+
+# 运行状态不能只看 screen：用户也可能在前台/其他会话启动服务，或 screen 名称变更。
+# 8001 本机 TCP 可连接时也视为 MaiBot 活着，避免 WebUI 可用但 status 误报停止。
+maibot_port_open() {
+  (exec 3<>/dev/tcp/127.0.0.1/8001) >/dev/null 2>&1
+}
+is_running() {
+  screen -ls 2>/dev/null | grep -q "[.]$SCREEN_NAME" || maibot_port_open
+}
+napcat_port_open() {
+  local port="$1"
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+}
+napcat_running() {
+  screen -ls 2>/dev/null | grep -q "[.]$NAPCAT_SCREEN" \
+    || napcat_port_open 6099 \
+    || napcat_port_open "$NAPCAT_WS_PORT"
+}
+napcat_webui_port() {
+  local p
+  for p in $(seq 6099 6199); do
+    if napcat_port_open "$p"; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+napcat_log_url() {
+  local f
+  for f in "$NAPCAT_LOG" "$NAPCAT_DIR/napcat.log" "/opt/QQ/resources/app/app_launcher/napcat.log"; do
+    [ -f "$f" ] || continue
+    grep -Eo 'https?://(127\.0\.0\.1|localhost):[0-9]+/webui([^[:space:]]*)?' "$f" | tail -1 && return 0
+  done
+  return 1
+}
+sync_napcat_config() {
+  local target="/opt/QQ/resources/app/app_launcher/napcat/config"
+  [ -d "$target" ] || return 0
+  mkdir -p "$target"
+  cp -f "$NAPCAT_DIR/config"/onebot11_*.json "$target/" 2>/dev/null || true
+  [ -f "$NAPCAT_DIR/config/webui.json" ] && cp -f "$NAPCAT_DIR/config/webui.json" "$target/webui.json"
+  chmod 600 "$target"/*.json 2>/dev/null || true
+}
+
+check_env() {
+  say ""
+  say "${BOLD}===== 环境检查 =====${NC}"
+  [ "$(uname -m)" = "aarch64" ] && ok "CPU aarch64" || warn "异常架构 $(uname -m)"
+  local missing=""
+  for c in git curl gcc jq screen; do
+    have "$c" && ok "命令 $c 就绪" || { warn "缺少 $c"; missing="$missing $c"; }
+  done
+  have uv && ok "uv 已安装" || warn "uv 未安装（install 会自动装）"
+  [ -n "$missing" ] && info "可执行：apt install -y$missing"
+}
+
+check_config() {
+  say ""
+  say "${BOLD}===== MaiBot 配置检查 =====${NC}"
+  local ok_all=1
+  ck(){ if [ -e "$1" ]; then ok "$2"; else warn "$2 缺失（$3）"; ok_all=0; fi; }
+  ck "$BOT_DIR/.git"                     "MaiBot 源码"      "install"
+  ck "$BOT_DIR/.venv"                    "Python 虚拟环境"   "install/update"
+  ck "$BOT_DIR/config/bot_config.toml"   "Bot/WebUI 配置"    "首次启动生成"
+  ck "$BOT_DIR/config/model_config.toml" "模型配置"          "首次启动生成"
+  ck "$BOT_DIR/data/webui.json"          "WebUI 访问密钥"    "首次启动生成"
+  [ "$ok_all" = "1" ] && ok "配置齐备" || warn "存在缺失项"
+}
+
+check() { check_env; check_config; }
+
+install_system_deps() {
+  fix_debian_mirror || return 1
+  # python3/pip 必须预装：否则 uv 会去 GitHub 下载 Python 解释器（国内常失败），
+  # pip 也是 uv 官方安装脚本不可用时的兜底手段。
+  apt_install git curl wget ca-certificates build-essential jq screen unzip \
+    python3 python3-venv python3-pip \
+    || { err "系统依赖安装失败（可重试，或检查网络）"; return 1; }
+}
+
+# uv 官方安装脚本在 astral.sh 上，国内常不可达；这里额外准备
+# "GitHub Release 直接下二进制" 与 "PyPI 镜像 pip" 两条兜底路径。
+UV_FALLBACK_VERSION="v0.12.22"
+
+install_uv_from_github() {
+  local ver="$1" url bin tmpdir
+  if [ -z "$ver" ]; then
+    ver=$(curl -s --connect-timeout 15 https://api.github.com/repos/astral-sh/uv/releases/latest 2>/dev/null \
+          | jq -r '.tag_name // empty' 2>/dev/null)
+  fi
+  [ -z "$ver" ] && ver="$UV_FALLBACK_VERSION"
+  local asset="uv-aarch64-unknown-linux-gnu.tar.gz"
+  tmpdir=$(mktemp -d) || return 1
+  for url in \
+    "https://github.com/astral-sh/uv/releases/download/$ver/$asset" \
+    "${GITHUB_PROXY}https://github.com/astral-sh/uv/releases/download/$ver/$asset" ; do
+    info "下载 uv 二进制（$ver）：$url"
+    if curl -fL --connect-timeout 20 --retry 2 -o "$tmpdir/$asset" "$url" 2>/dev/null \
+       && tar -xzf "$tmpdir/$asset" -C "$tmpdir" 2>/dev/null; then
+      bin=$(find "$tmpdir" -type f -name uv 2>/dev/null | head -1)
+      if [ -n "$bin" ]; then
+        mkdir -p "$HOME/.local/bin"
+        cp -f "$bin" "$HOME/.local/bin/uv" && chmod +x "$HOME/.local/bin/uv"
+        local x; x=$(find "$tmpdir" -type f -name uvx 2>/dev/null | head -1)
+        [ -n "$x" ] && { cp -f "$x" "$HOME/.local/bin/uvx"; chmod +x "$HOME/.local/bin/uvx"; }
+        rm -rf "$tmpdir"
+        return 0
+      fi
+    fi
+  done
+  rm -rf "$tmpdir"
+  return 1
+}
+
+install_uv() {
+  have uv && { ok "uv 已装，跳过"; return 0; }
+  info "安装 uv（Python 包管理器）..."
+  export UV_INSTALL_DIR="$HOME/.local/bin"
+
+  # 路径 1：官方安装脚本
+  local installer=""
+  installer=$(mktemp) || installer=""
+  if [ -n "$installer" ] \
+     && run_logged curl -LsSf --connect-timeout 20 -o "$installer" https://astral.sh/uv/install.sh \
+     && run_logged sh "$installer"; then
+    rm -f "$installer"
+    export PATH="$HOME/.local/bin:$PATH"
+    have uv && { ok "uv 安装完成（官方脚本）"; return 0; }
+  fi
+  rm -f "$installer"
+
+  # 路径 2：GitHub Release 二进制（直连失败自动走代理）
+  warn "官方安装脚本不可用，改为直接下载 uv 二进制 ..."
+  export PATH="$HOME/.local/bin:$PATH"
+  if install_uv_from_github; then
+    have uv && { ok "uv 安装完成（GitHub 二进制）"; return 0; }
+  fi
+
+  # 路径 3：PyPI 镜像 + pip 兜底
+  warn "改用 PyPI 镜像安装 uv ..."
+  local pipcmd=""
+  have pip && pipcmd="pip"
+  [ -z "$pipcmd" ] && have pip3 && pipcmd="pip3"
+  if [ -n "$pipcmd" ]; then
+    if UV_INDEX_URL="$PY_INDEX_URL" run_logged "$pipcmd" install --user -U uv --break-system-packages; then
+      export PATH="$HOME/.local/bin:$PATH"
+      have uv && { ok "uv 安装完成（PyPI 镜像）"; return 0; }
+    fi
+    # 老版本 pip 不认识 --break-system-packages，去掉该参数再试一次
+    UV_INDEX_URL="$PY_INDEX_URL" run_logged "$pipcmd" install --user -U uv || true
+    export PATH="$HOME/.local/bin:$PATH"
+    have uv && { ok "uv 安装完成（PyPI 镜像）"; return 0; }
+  else
+    warn "未找到 pip/pip3，跳过 PyPI 兜底（可由 apt 安装 python3-pip）"
+  fi
+
+  err "uv 安装失败（三条路径都不可用）。请在 Termux 里执行 bash ~/maibot-onekey.sh install 查看完整报错"
+  return 1
+}
+
+clone_repo() {
+  mkdir -p "$BASE_DIR"
+  # 只有当 .git 是一个可用仓库时才跳过；残缺的 .git 会让后续 uv sync 失败
+  if [ -d "$BOT_DIR/.git" ]; then
+    if git -C "$BOT_DIR" rev-parse HEAD >/dev/null 2>&1; then
+      ok "源码已存在，跳过克隆"
+      return 0
+    fi
+    warn "检测到残缺的源码目录（.git 不完整），清理后重新克隆"
+    rm -rf "$BOT_DIR"
+  fi
+  if [ -e "$BOT_DIR" ]; then
+    err "源码目录已存在但不是 Git 仓库，保留原文件；请检查或备份后重试：$BOT_DIR"
+    return 1
+  fi
+  info "克隆 MaiBot 源码（约 100MB，带进度）..."
+  if run_logged git clone --progress --depth 1 "$REPO" "$BOT_DIR"; then
+    [ -d "$BOT_DIR/.git" ] && { ok "源码克隆完成"; return 0; }
+  fi
+  warn "官方线路失败，切换国内代理镜像重试 ..."
+  rm -rf "$BOT_DIR"
+  if run_logged git clone --progress --depth 1 "$REPO_MIRROR" "$BOT_DIR"; then
+    [ -d "$BOT_DIR/.git" ] && { ok "源码克隆完成（镜像）"; return 0; }
+  fi
+  # 镜像也失败时清掉残缺的 .git，否则下次会被误判成"源码已存在"而跳过克隆
+  if [ -d "$BOT_DIR/.git" ] && ! git -C "$BOT_DIR" rev-parse HEAD >/dev/null 2>&1; then
+    rm -rf "$BOT_DIR"
+  fi
+  err "源码克隆失败，请检查网络后重试"
+  return 1
+}
+
+install_deps() {
+  cd "$BOT_DIR" || return 1
+  # UV_PYTHON_DOWNLOADS=never：禁止 uv 去 GitHub 下载 Python 解释器（国内常失败），
+  # 改用 apt 装好的系统 python3；这也是把 python3 加进系统依赖的原因。
+  if [ ! -d ".venv" ]; then
+    info "创建 Python 虚拟环境（使用系统 python3，不联网下载解释器）..."
+    UV_PYTHON_DOWNLOADS=never run_logged uv venv --python python3 \
+      || UV_PYTHON_DOWNLOADS=never run_logged uv venv \
+      || { err "虚拟环境创建失败（确认已安装 python3：apt install python3 python3-venv）"; return 1; }
+  fi
+  info "安装 Python 依赖（约数百 MB，走阿里云 PyPI 镜像，请耐心等待）..."
+  if UV_INDEX_URL="$PY_INDEX_URL" UV_PYTHON_DOWNLOADS=never run_logged uv sync; then
+    ok "Python 依赖安装完成"
+    return 0
+  fi
+  err "依赖安装失败（常见原因：网络中断，可重试，已下载部分会复用）"
+  return 1
+}
+
+install() {
+  STEP_ALL=4
+  STEP_NO=0
+  say "${BOLD}===== 开始部署 MaiBot =====${NC}"
+  net_check || return 1
+  step "系统依赖"      ; install_system_deps || return 1
+  step "uv 环境"       ; install_uv          || return 1
+  step "拉取源码"      ; clone_repo          || return 1
+  step "安装依赖"      ; install_deps        || return 1
+  mkdir -p "$BOT_DIR/logs" "$BOT_DIR/data"
+  say ""
+  ok "MaiBot 部署完成"
+  info "下一步：bash $0 fg 前台启动确认协议（仅首次），之后用 start"
+  info "WebUI：http://127.0.0.1:8001   密钥：bash $0 token"
+}
+
+update() {
+  [ -d "$BOT_DIR/.git" ] || { err "尚未部署，先 install"; return 1; }
+  if is_running; then
+    err "MaiBot 正在运行，请先停止再更新（后台任务不能交互确认）"
+    return 1
+  fi
+  cd "$BOT_DIR" || return 1
+  info "拉取代码 ..."
+  git pull --ff-only || { err "拉取失败"; return 1; }
+  info "更新依赖 ..."
+  UV_INDEX_URL="$PY_INDEX_URL" uv sync || { err "依赖更新失败"; return 1; }
+  ok "更新完成，用 start 启动"
+}
+
+start() {
+  [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
+  if [ ! -f "$BOT_DIR/data/webui.json" ]; then
+    warn "首次启动需前台确认协议：bash ~/maibot-onekey.sh fg"; return 1
+  fi
+  is_running && { warn "MaiBot 已在运行"; return 0; }
+  cd "$BOT_DIR" || return 1
+  mkdir -p logs
+  screen -dmS "$SCREEN_NAME" bash -c "uv run python bot.py 2>&1 | tee '$LOG_FILE'"
+  sleep 3
+  if is_running; then
+    ok "MaiBot 后台启动（$SCREEN_NAME）"
+  else
+    err "启动失败，用 fg 看报错"
+    return 1
+  fi
+}
+
+fg_run() {
+  [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
+  cd "$BOT_DIR" || return 1
+  info "前台启动（确认协议后 Ctrl+C 退出）..."
+  uv run python bot.py
+}
+
+stop() {
+  is_running || { warn "MaiBot 未运行"; return 0; }
+  screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1
+  sleep 1; pkill -f "python bot.py" 2>/dev/null
+  ok "MaiBot 已停止"
+}
+
+restart() { stop; start; }
+
+status() {
+  say ""
+  is_running && ok "MaiBot 运行中（$SCREEN_NAME） WebUI http://127.0.0.1:8001" || warn "MaiBot 未运行"
+}
+
+# 端口开着不等于页面能打开：真正发一次 HTTP 请求，避免把打不开的地址丢给浏览器。
+webui_http_code() {
+  local url="$1" code="000"
+  if have curl; then
+    # curl 失败时也会打印 000，再叠加兜底就会变成 000000，这里统一成一个值。
+    code=$(curl -s -o /dev/null -m 6 -w '%{http_code}' "$url" 2>/dev/null || true)
+    case "$code" in ''|*[!0-9]*) code=000 ;; 000) code=000 ;; esac
+  fi
+  printf '%s' "$code"
+}
+webui_http_ok() {
+  local code
+  code=$(webui_http_code "$1")
+  [ -n "$code" ] && [ "$code" != "000" ] && [ "$code" != "404" ]
+}
+
+webui() {
+  if ! is_running; then
+    warn "MaiBot 未运行，无法打开 WebUI"
+    printf 'WEBUI_UNAVAILABLE=1\n'
+    return 1
+  fi
+  if ! webui_http_ok 'http://127.0.0.1:8001/'; then
+    warn "MaiBot 进程在运行，但 8001 的 WebUI 没有响应（HTTP $(webui_http_code 'http://127.0.0.1:8001/')）"
+    info "可能仍在启动中：等 10~30 秒后再点一次"
+    info "仍打不开请看日志：bash $0 logs"
+    printf 'WEBUI_UNAVAILABLE=1\n'
+    return 1
+  fi
+  ok "MaiBot WebUI 可用：http://127.0.0.1:8001"
+  printf 'WEBUI_URL=%s\n' 'http://127.0.0.1:8001/'
+}
+
+# 一次性检查两个 WebUI 是否真的能打开（App 的「检测 WebUI」按钮）
+webui_check() {
+  say ""
+  say "${BOLD}===== WebUI 可用性检测 =====${NC}"
+  local rc=0 code
+  if is_running; then
+    code=$(webui_http_code 'http://127.0.0.1:8001/')
+    if webui_http_ok 'http://127.0.0.1:8001/'; then
+      ok "MaiBot WebUI 可打开（HTTP $code）http://127.0.0.1:8001"
+    else
+      warn "MaiBot 进程在，但 WebUI 无响应（HTTP $code）"
+      rc=1
+    fi
+  else
+    warn "MaiBot 未运行"
+    rc=1
+  fi
+  local p
+  p=$(napcat_webui_port 2>/dev/null || true)
+  if [ -n "$p" ]; then
+    code=$(webui_http_code "http://127.0.0.1:$p/webui")
+    if [ "$code" != "000" ]; then
+      ok "NapCat WebUI 可打开（HTTP $code，端口 $p）"
+    else
+      warn "NapCat 端口 $p 在监听，但 HTTP 无响应"
+      rc=1
+    fi
+  else
+    warn "NapCat WebUI 未监听（6099-6199 均不可用）"
+    rc=1
+  fi
+  return "$rc"
+}
+
+logs() {
+  if [ ! -f "$LOG_FILE" ]; then
+    warn "日志文件不存在"
+    return 1
+  fi
+  if [ "${MAIBOT_QUERY:-0}" = 1 ]; then
+    tail -n 80 "$LOG_FILE"
+  else
+    tail -n 30 -f "$LOG_FILE"
+  fi
+}
+
+token() {
+  if [ -f "$BOT_DIR/data/webui.json" ]; then
+    have jq && jq -r '.access_token' "$BOT_DIR/data/webui.json" || grep -o '"access_token"[^,]*' "$BOT_DIR/data/webui.json"
+  else
+    err "未找到 data/webui.json（尚未启动过）"
+  fi
+}
+
+napcat_check() {
+  say ""
+  say "${BOLD}===== NapCat 检查 =====${NC}"
+  [ -d "$NAPCAT_DIR" ] && ok "NapCat 目录" || warn "NapCat 未装（napcat-install）"
+  [ -f "/opt/QQ/qq" ] && ok "Linux QQ" || warn "Linux QQ 未装"
+  [ -f "$NAPCAT_ENV" ] && ok "QQ 号：$(grep ACCOUNT "$NAPCAT_ENV" | cut -d= -f2)" || warn "未配置 QQ 号（napcat-setup）"
+  napcat_running && ok "NapCat 运行中" || warn "NapCat 未运行"
+}
+
+napcat_install() {
+  STEP_ALL=4
+  STEP_NO=0
+  say "${BOLD}===== 开始安装 NapCat =====${NC}"
+
+  step "系统依赖（含 Xvfb 虚拟显示，体积较大）"
+  fix_debian_mirror
+  apt_install libnss3 libnotify4 libsecret-1-0 libgbm1 libasound2 \
+    fonts-wqy-zenhei gnutls-bin libglib2.0-dev libdbus-1-3 libgtk-3-0 \
+    libxss1 libxtst6 libatspi2.0-0 libx11-xcb1 ffmpeg unzip jq curl xvfb \
+    || { err "依赖安装失败，可重试（已下载部分会复用）"; return 1; }
+
+  step "安装 Linux QQ"
+  if [ -f "/opt/QQ/qq" ]; then
+    ok "Linux QQ 已安装，跳过"
+  else
+    # 腾讯 CDN 在部分手机网络/代理下不可达。先保留官方动态地址，
+    # 再从维护 QQ 官方安装包归档的 GitHub release 动态选 arm64 deb。
+    local official_url release_json asset_url asset_name expected_sum actual_sum
+    official_url=$(curl -fsSL --connect-timeout 12 --max-time 25 \
+      "https://im.qq.com/rainbow/linuxQQDownload" 2>/dev/null \
+      | grep -oE 'https://dldir1[^" ]*arm64_01\.deb' | head -1)
+    [ -n "$official_url" ] || official_url="$LINUXQQ_URL"
+    info "QQ 官方候选：$official_url"
+
+    release_json=$(curl -fsSL --connect-timeout 12 --max-time 25 \
+      "https://api.github.com/repos/Rodert/qq-versions/releases/latest" 2>/dev/null || true)
+    # API 不可达时仍保留一份已核验的归档候选及其 SHA-256。
+    asset_name=$(printf '%s' "$release_json" | jq -r '.assets[]? | select(.name | test("_arm64_01\\.deb$")) | .name' 2>/dev/null | head -1)
+    if [ -n "$asset_name" ]; then
+      asset_url=$(printf '%s' "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name == $n) | .browser_download_url' 2>/dev/null | head -1)
+      info "QQ 归档最新备用包：$asset_name"
+    else
+      asset_name="QQ_3.2.32_260812_arm64_01.deb"
+      asset_url="https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4/$asset_name"
+      warn "GitHub API 不可用，使用已校验的固定备用包：$asset_name"
+    fi
+
+    # 验证下载完整性：下载必须是 deb 包，且归档仓库提供 SHA256SUMS 时校验摘要。
+    if ! dl /tmp/linuxqq.deb "$official_url" "$asset_url" "${GITHUB_PROXY}${asset_url}"; then
+      err "QQ 官方 CDN 与 GitHub 归档都不可达。请检查手机的代理/VPN 是否覆盖 Termux 流量"
+      return 1
+    fi
+    if ! ar t /tmp/linuxqq.deb >/dev/null 2>&1; then
+      err "下载结果不是有效的 Debian 安装包（可能是代理错误页），拒绝安装"
+      rm -f /tmp/linuxqq.deb
+      return 1
+    fi
+    if [ -n "$asset_name" ]; then
+      expected_sum=$(printf '%s' "$release_json" | jq -r --arg n "$asset_name" '.body // "" | split("\\n")[] | select(test("`" + $n + "`")) | match("[0-9a-f]{64}").string' 2>/dev/null | head -1)
+      [ -n "$expected_sum" ] || [ "$asset_name" != "QQ_3.2.32_260812_arm64_01.deb" ] || expected_sum="8796ccfd66acc025ef18db37185532d40bc8c58921e17da6d28c295acbcf8f92"
+      if [ -n "$expected_sum" ]; then
+        actual_sum=$(sha256sum /tmp/linuxqq.deb | awk '{print $1}')
+        if [ "$expected_sum" != "$actual_sum" ]; then
+          err "QQ 安装包 SHA-256 校验失败，已拒绝安装"
+          rm -f /tmp/linuxqq.deb
+          return 1
+        fi
+        ok "QQ 安装包 SHA-256 校验通过"
+      else
+        warn "GitHub 归档没有提供该文件摘要，只通过 deb 格式检查"
+      fi
+    fi
+    info "安装 Linux QQ 包 ..."
+    if run_logged dpkg -i --force-depends /tmp/linuxqq.deb; then
+      ok "Linux QQ 安装完成"
+    else
+      warn "dpkg 有警告，尝试补齐依赖 ..."
+      run_logged apt-get install -y -f || { err "Linux QQ 依赖修复失败"; return 1; }
+      [ -f "/opt/QQ/qq" ] || { err "Linux QQ 安装失败"; return 1; }
+      ok "Linux QQ 安装完成（已补齐依赖）"
+    fi
+    rm -f /tmp/linuxqq.deb
+  fi
+
+  step "下载 NapCat（带进度条）"
+  if [ -f "$NAPCAT_DIR/napcat.mjs" ]; then
+    ok "NapCat 已存在，跳过下载"
+  else
+    mkdir -p "$NAPCAT_DIR"
+    local ver=""
+    info "查询 NapCat 最新版本 ..."
+    ver=$(curl -s --connect-timeout 15 "https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest" 2>/dev/null | jq -r '.tag_name // empty')
+    if [ -z "$ver" ]; then
+      warn "无法获取最新版本号，改用已知可用版本：$NAPCAT_FALLBACK_VERSION"
+      ver="$NAPCAT_FALLBACK_VERSION"
+    fi
+    info "目标版本：$ver"
+    # 直连 GitHub 优先；失败再走代理（gh-proxy.org / ghfast.top 已实测失效）
+    dl /tmp/NapCat.Shell.zip \
+      "https://github.com/NapNeko/NapCatQQ/releases/download/$ver/NapCat.Shell.zip" \
+      "${GITHUB_PROXY}https://github.com/NapNeko/NapCatQQ/releases/download/$ver/NapCat.Shell.zip" \
+      || return 1
+    info "解压 NapCat ..."
+    mkdir -p "$NAPCAT_DIR"
+    if ! run_logged unzip -o /tmp/NapCat.Shell.zip -d "$NAPCAT_DIR"; then
+      err "解压失败（下载文件可能不完整，请重试）"
+      rm -rf "$NAPCAT_DIR"
+      return 1
+    fi
+    rm -f /tmp/NapCat.Shell.zip
+    chmod +x "$NAPCAT_DIR"/*.sh 2>/dev/null
+    ok "NapCat 解压完成"
+  fi
+
+  # If the user already entered QQ before installation, generate its server configs now.
+  if [ -f "$NAPCAT_ENV" ]; then
+    local saved_qq
+    saved_qq=$(sed -n 's/^ACCOUNT=//p' "$NAPCAT_ENV" | head -1)
+    if [ -n "$saved_qq" ]; then
+      napcat_setup "$saved_qq" || return 1
+    fi
+  fi
+
+  step "注入 NapCat 到 QQ 启动器"
+  local launcher="/opt/QQ/resources/app/app_launcher"
+  if [ -d "$launcher" ]; then
+    echo "(async () => {await import('file://$NAPCAT_DIR/napcat.mjs');})();" > "$launcher/index.js"
+    ok "NapCat 已注入"
+  else
+    err "未找到 $launcher，注入失败（QQ 可能未正确安装）"
+    return 1
+  fi
+
+  say ""
+  ok "NapCat 安装完成"
+  info "下一步：bash $0 napcat-setup <QQ号>"
+  return 0
+}
+
+napcat_setup() {
+  [ -d "$NAPCAT_DIR" ] || { err "NapCat 未装，先 napcat-install"; return 1; }
+  local qq="${1:-}"
+  [ -z "$qq" ] && { printf '请输入机器人 QQ 号：'; read -r qq; }
+  # QQ 号会被拼进文件名和 JSON：必须只允许数字，否则可造成路径穿越/配置损坏
+  case "$qq" in
+    ''|*[!0-9]*) err "QQ 号只能是纯数字（收到：$qq）"; return 1 ;;
+  esac
+  if [ "${#qq}" -lt 5 ] || [ "${#qq}" -gt 15 ]; then
+    err "QQ 号位数不正确（应为 5-15 位数字）"
+    return 1
+  fi
+  mkdir -p "$NAPCAT_DIR/config"
+  echo "ACCOUNT=$qq" > "$NAPCAT_ENV"
+  chmod 600 "$NAPCAT_ENV" 2>/dev/null || true
+  # 配置可在 NapCat 下载前生成；NapCat 安装后会直接复用。
+  cat > "$NAPCAT_DIR/config/onebot11_$qq.json" <<EOF
+{
+  "network": {
+    "httpServers": [],
+    "httpClients": [],
+    "websocketServers": [{
+      "name": "MaiBot",
+      "enable": true,
+      "host": "127.0.0.1",
+      "port": $NAPCAT_WS_PORT,
+      "messagePostFormat": "array",
+      "reportSelfMessage": false,
+      "token": "",
+      "enableForcePushEvent": true,
+      "debug": false,
+      "heartInterval": 30000
+    }],
+    "websocketClients": []
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": true,
+  "parseMultMsg": false
+}
+EOF
+  # NapCat Shell reads the config under QQ's app_launcher; keep a local copy too.
+  local launcher_cfg_dir="/opt/QQ/resources/app/app_launcher/napcat/config"
+  if [ -d "/opt/QQ/resources/app/app_launcher/napcat" ]; then
+    mkdir -p "$launcher_cfg_dir"
+    cp -f "$NAPCAT_DIR/config/onebot11_$qq.json" "$launcher_cfg_dir/onebot11_$qq.json"
+  fi
+  # WebUI config path in Shell install; loopback host is intentionally local-only.
+  local webui_cfg="$NAPCAT_DIR/config/webui.json" webui_token
+  mkdir -p "$(dirname "$webui_cfg")"
+  if [ ! -s "$webui_cfg" ]; then
+    webui_token=$(od -An -N24 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$webui_token" ] || webui_token="$(date +%s)$RANDOM$RANDOM"
+    cat > "$webui_cfg" <<EOF
+{
+  "host": "127.0.0.1",
+  "port": 6099,
+  "token": "$webui_token",
+  "loginRate": 3
+}
+EOF
+    chmod 600 "$webui_cfg" 2>/dev/null || true
+  fi
+  if [ -d "/opt/QQ/resources/app/app_launcher/napcat" ]; then
+    cp -f "$webui_cfg" "/opt/QQ/resources/app/app_launcher/napcat/config/webui.json"
+    chmod 600 "/opt/QQ/resources/app/app_launcher/napcat/config/webui.json" 2>/dev/null || true
+  fi
+  ok "已预配置正向 WebSocket：ws://127.0.0.1:$NAPCAT_WS_PORT（仅本机）"
+  info "QQ 号已记录：$qq（NapCat 登录的 QQ 必须与它一致）"
+  info "适配器不用旧 NapCat 适配器（已归档），装官方「统一 QQ 连接器」："
+  info "  MaiBot WebUI → 插件管理 → 从 Git 安装：https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter"
+  info "装好后回到 App 点「一键配置适配器」，会自动写入 127.0.0.1:$NAPCAT_WS_PORT 与 qq_account"
+  info "NapCat WebUI：127.0.0.1:6099（随机 Token，仅本机访问）"
+}
+
+napcat_start() {
+  [ -d "$NAPCAT_DIR" ] || { err "NapCat 未装"; return 1; }
+  [ -f "$NAPCAT_ENV" ] || { warn "先 napcat-setup <QQ号>"; return 1; }
+  napcat_running && { warn "NapCat 已在运行"; return 0; }
+  source "$NAPCAT_ENV"
+  cat > "$NAPCAT_DIR/start_qq.sh" <<EOF
+#!/usr/bin/env bash
+export DISPLAY=:1
+Xvfb :1 -screen 0 1080x760x16 +extension GLX +render >/dev/null 2>&1 &
+sleep 3
+cd "$NAPCAT_DIR"
+\$(command -v qq || echo /opt/QQ/qq) --no-sandbox -q "$ACCOUNT" 2>&1 | tee "$NAPCAT_LOG"
+EOF
+  chmod +x "$NAPCAT_DIR/start_qq.sh"
+  : > "$NAPCAT_LOG" 2>/dev/null || true
+  sync_napcat_config
+  screen -dmS "$NAPCAT_SCREEN" "$NAPCAT_DIR/start_qq.sh"
+  local waited=0 webui_port=""
+  while [ "$waited" -lt 30 ]; do
+    sleep 1
+    waited=$((waited + 1))
+    webui_port=$(napcat_webui_port 2>/dev/null || true)
+    [ -n "$webui_port" ] && break
+    if ! screen -ls 2>/dev/null | grep -q "[.]$NAPCAT_SCREEN"; then break; fi
+  done
+  if [ -n "$webui_port" ]; then
+    ok "NapCat 已启动，WebUI 端口：$webui_port"
+    info "扫码：bash $0 napcat-webui"
+  elif napcat_running; then
+    warn "NapCat 进程已启动，但 WebUI 尚未监听 6099-6199"
+    info "请执行 bash $0 napcat-webui 查看启动日志"
+  else
+    err "启动失败，看 $NAPCAT_LOG"
+    tail -n 20 "$NAPCAT_LOG" 2>/dev/null | while IFS= read -r l; do info "$l"; done
+    return 1
+  fi
+}
+
+napcat_stop() {
+  if ! napcat_running && ! pgrep -f "qq --no-sandbox" >/dev/null 2>&1; then
+    warn "NapCat 未运行"; return 0
+  fi
+  screen -S "$NAPCAT_SCREEN" -X quit >/dev/null 2>&1
+  pkill -f "qq --no-sandbox" 2>/dev/null
+  pkill -f "Xvfb :1" 2>/dev/null
+  ok "NapCat 已停止"
+}
+
+napcat_status() {
+  say ""
+  local p
+  p=$(napcat_webui_port 2>/dev/null || true)
+  if [ -n "$p" ]; then
+    ok "NapCat 运行中（$NAPCAT_SCREEN） WebUI端口 $p WS端口 $NAPCAT_WS_PORT"
+  elif napcat_running; then
+    warn "NapCat 进程运行中，但 WebUI 端口未监听"
+  else
+    warn "NapCat 未运行"
+  fi
+}
+
+napcat_webui() {
+  local port cfg token url log_url
+  port=$(napcat_webui_port 2>/dev/null || true)
+  if [ -z "$port" ]; then
+    warn "NapCat WebUI 未监听（已检查 6099-6199），不能打开链接"
+    info "NapCat 进程状态：$(napcat_running && echo 运行中 || echo 未运行)"
+    tail -n 20 "$NAPCAT_LOG" 2>/dev/null | while IFS= read -r l; do info "$l"; done
+    # 保持查询动作可诊断：输出已知配置地址，但明确标记不可打开。
+    printf 'WEBUI_UNAVAILABLE=1\n'
+    return 0
+  fi
+  # NapCat Shell 的 config 目录位于启动器目录；也检查本脚本独立 NapCat 目录。
+  cfg="/opt/QQ/resources/app/app_launcher/napcat/config/webui.json"
+  [ -f "$cfg" ] || cfg="$NAPCAT_DIR/config/webui.json"
+  token=""
+  if [ -f "$cfg" ]; then
+    if have jq; then
+      token=$(jq -r '.token // .access_token // empty' "$cfg" 2>/dev/null)
+    else
+      # 容器里不一定装了 jq：用 sed 兜底读取 token，避免只能打开无 Token 的登录页。
+      token=$(sed -n 's/.*"\(token\|access_token\)"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' "$cfg" 2>/dev/null | head -1)
+    fi
+  fi
+  case "$token" in null) token="" ;; esac
+  log_url=$(napcat_log_url 2>/dev/null || true)
+  if [ -n "$log_url" ]; then
+    url="$log_url"
+    info "已从 NapCat 日志读取实际 WebUI 地址"
+  elif [ -n "$token" ]; then
+    url="http://127.0.0.1:$port/webui?token=$token"
+  else
+    url="http://127.0.0.1:$port/webui/"
+    warn "未找到 WebUI Token；打开登录页后从 NapCat 日志确认 Token"
+  fi
+  local code
+  code=$(webui_http_code "http://127.0.0.1:$port/webui")
+  if [ "$code" = "000" ]; then
+    warn "NapCat 端口 $port 在监听，但 WebUI 没有返回 HTTP 响应"
+    info "通常是在启动中或登录未完成，等一会儿再点；仍失败请看：$NAPCAT_LOG"
+    printf 'WEBUI_UNAVAILABLE=1\n'
+    return 0
+  fi
+  ok "NapCat WebUI 可用（HTTP $code，端口 $port）"
+  info "NapCat WebUI：$url"
+  printf 'WEBUI_URL=%s\n' "$url"
+}
+
+# ---------- 适配器（统一 QQ 连接器）配置 ----------
+
+# 在指定 TOML 节里设置一个键：存在则改值，不存在则补行，整节不存在则追加。
+toml_set_key() {
+  local file="$1" section="$2" key="$3" value="$4" tmp
+  [ -f "$file" ] || return 1
+  tmp="$file.tmp.$$"
+  awk -v sec="$section" -v key="$key" -v val="$value" '
+    BEGIN { insec = 0; done = 0; found = 0 }
+    /^[[:space:]]*\[/ {
+      if (insec && !done) { print key " = " val; done = 1 }
+      line = $0
+      gsub(/^[[:space:]]+/, "", line)
+      gsub(/[[:space:]]+$/, "", line)
+      insec = (line == "[" sec "]")
+      if (insec) found = 1
+      print
+      next
+    }
+    {
+      if (insec && $0 ~ ("^[[:space:]]*" key "[[:space:]]*=")) {
+        if (!done) { print key " = " val; done = 1 }
+        next
+      }
+      print
+    }
+    END {
+      if (insec && !done) { print key " = " val }
+      if (!found) { print ""; print "[" sec "]"; print key " = " val }
+    }
+  ' "$file" > "$tmp" && mv -f "$tmp" "$file"
+}
+
+adapter_plugin_dir() {
+  local d
+  for d in "$BOT_DIR/plugins/MaiBot-SnowLuma-Adapter" "$BOT_DIR/plugins/MaiBot-Napcat-Adapter"; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+  done
+  for d in "$BOT_DIR"/plugins/*/; do
+    [ -f "$d/_manifest.json" ] || continue
+    grep -qiE '"(id|name)"[[:space:]]*:[[:space:]]*"[^"]*(snowluma|napcat)[^"]*"' "$d/_manifest.json" 2>/dev/null \
+      && { printf '%s\n' "${d%/}"; return 0; }
+  done
+  return 1
+}
+
+# 把 bot_config.toml 的机器人账号 + 适配器连接参数一次配好
+adapter_setup() {
+  local qq="${1:-}"
+  case "$qq" in
+    ''|*[!0-9]*) err "QQ 号只能是纯数字（收到：${qq:-空}）"; return 1 ;;
+  esac
+  if [ "${#qq}" -lt 5 ] || [ "${#qq}" -gt 15 ]; then
+    err "QQ 号位数不正确（应为 5-15 位数字）"; return 1
+  fi
+  [ -d "$BOT_DIR" ] || { err "MaiBot 尚未部署，先执行 install"; return 1; }
+
+  say ""
+  say "${BOLD}===== 配置适配器连接 =====${NC}"
+  local bot_cfg="$BOT_DIR/config/bot_config.toml"
+  if [ -f "$bot_cfg" ]; then
+    cp -f "$bot_cfg" "$bot_cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    toml_set_key "$bot_cfg" bot platform '"qq"'
+    toml_set_key "$bot_cfg" bot qq_account "\"$qq\""
+    ok "bot_config.toml：platform=qq，qq_account=$qq"
+  else
+    warn "未找到 config/bot_config.toml：先启动一次 MaiBot 生成配置，再回来点这里"
+  fi
+
+  local plugdir=""
+  if plugdir=$(adapter_plugin_dir); then
+    local cfg="$plugdir/config.toml"
+    if [ ! -f "$cfg" ]; then
+      cat > "$cfg" <<'ADAPTER_EOF'
+[plugin]
+enabled = true
+qq_face_parse_mode = "description"
+config_version = "2.5.0"
+
+[client]
+client_type = "auto"
+server = "127.0.0.1"
+port = 3001
+token = ""
+heartbeat_interval = 30.0
+reconnect_delay_sec = 5.0
+action_timeout_sec = 15.0
+connection_id = ""
+
+[chat_abilities]
+enable_private_chat_tool = false
+enable_poke_tool = false
+enable_recall_tool = false
+enable_mute_tool = false
+enable_emoji_like_tool = false
+enable_forward_tool = false
+
+[notice]
+enabled = true
+enable_poke = true
+enable_friend_recall = true
+enable_group_recall = true
+enable_group_ban = true
+enable_group_msg_emoji_like = true
+enable_group_upload = true
+enable_group_increase = true
+enable_group_decrease = true
+enable_group_admin = true
+enable_essence = true
+enable_group_name = true
+
+[filters]
+ban_user_id = []
+ban_qq_bot = false
+regex_filter_enabled = false
+regex_filter_mode = "blacklist"
+regex_filter_patterns = []
+regex_filter_show_dropped = false
+
+[mute]
+admin_users = []
+allowed_groups = []
+min_duration = 60
+max_duration = 2592000
+
+[debug]
+enable_ada_debug_raw_message_log = false
+enable_ada_debug_raw_outbound_message_log = false
+ignore_self_message = false
+ADAPTER_EOF
+    else
+      cp -f "$cfg" "$cfg.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    fi
+    toml_set_key "$cfg" plugin enabled true
+    toml_set_key "$cfg" client client_type '"auto"'
+    toml_set_key "$cfg" client server '"127.0.0.1"'
+    toml_set_key "$cfg" client port "$NAPCAT_WS_PORT"
+    grep -Eq '^[[:space:]]*token[[:space:]]*=' "$cfg" || toml_set_key "$cfg" client token '""'
+    ok "适配器连接已写入：${cfg#$BOT_DIR/}"
+    info "client_type=auto  server=127.0.0.1  port=$NAPCAT_WS_PORT"
+  else
+    warn "还没安装适配器插件，连接参数稍后自动写入"
+    info "1) 先在 App 点「打开 MaiBot WebUI」"
+    info "2) 左侧「插件管理」→ 从 Git 安装：https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter"
+    info "3) 安装完成后回到 App，再点「一键配置适配器」"
+  fi
+
+  if napcat_port_open "$NAPCAT_WS_PORT"; then
+    ok "NapCat 正向 WebSocket 端口 $NAPCAT_WS_PORT 已监听"
+  else
+    warn "NapCat 正向 WebSocket 端口 $NAPCAT_WS_PORT 未监听（启动 NapCat 后再试）"
+  fi
+  info "最后重启 MaiBot 使配置生效：点「停止 MaiBot」再点「启动 MaiBot」"
+}
+
+adapter_status() {
+  say ""
+  say "${BOLD}===== 适配器连接状态 =====${NC}"
+  local plugdir="" cfg="" qq="" nap_qq="" port_ok="no"
+  if plugdir=$(adapter_plugin_dir); then
+    ok "适配器插件：${plugdir#$BOT_DIR/}"
+    cfg="$plugdir/config.toml"
+  else
+    warn "适配器插件：未安装（MaiBot-SnowLuma-Adapter）"
+  fi
+  if [ -f "$BOT_DIR/config/bot_config.toml" ]; then
+    qq=$(grep -E '^[[:space:]]*qq_account[[:space:]]*=' "$BOT_DIR/config/bot_config.toml" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' "'"'"'')
+  fi
+  [ -n "$qq" ] && ok "MaiBot qq_account：$qq" || warn "MaiBot qq_account：未设置"
+  if [ -f "${NAPCAT_ENV:-}" ]; then
+    nap_qq=$(grep -E '^[[:space:]]*ACCOUNT[[:space:]]*=' "$NAPCAT_ENV" 2>/dev/null | cut -d= -f2 | tr -d ' "'"'"'')
+  fi
+  [ -n "$nap_qq" ] && ok "NapCat 登录 QQ：$nap_qq" || warn "NapCat 登录 QQ：未配置"
+  if [ -n "$qq" ] && [ -n "$nap_qq" ] && [ "$qq" = "$nap_qq" ]; then
+    ok "两边 QQ 号一致"
+  elif [ -n "$qq" ] && [ -n "$nap_qq" ]; then
+    warn "两边 QQ 号不一致，麦麦会把自己的消息当成别人"
+  fi
+  if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+    if grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$cfg"; then
+      ok "插件 enabled：true"
+    else
+      warn "插件 enabled 不是 true（不会建立连接）"
+    fi
+    local p
+    p=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$cfg" | head -1 | cut -d= -f2 | tr -d ' ')
+    [ -n "$p" ] && info "插件连接端口：$p" || warn "插件未写 port"
+  fi
+  napcat_port_open "$NAPCAT_WS_PORT" && { ok "NapCat WS 端口 $NAPCAT_WS_PORT：已监听"; port_ok="yes"; } \
+    || warn "NapCat WS 端口 $NAPCAT_WS_PORT：未监听"
+  if [ "$port_ok" = "yes" ] && [ -n "$plugdir" ]; then
+    ok "链路就绪：QQ → NapCat → ws://127.0.0.1:$NAPCAT_WS_PORT → 适配器 → MaiBot"
+  else
+    info "链路未就绪，按上面的提示补齐（装插件 / 启动 NapCat / 配 QQ 号）"
+  fi
+}
+
+# ---------- 服务器模式：全启 / 全停 / 自愈守护 ----------
+
+allstart() {
+  say ""
+  say "${BOLD}===== 启动全部服务 =====${NC}"
+  local rc=0
+  if [ -f "$BOT_DIR/data/webui.json" ]; then
+    start || rc=1
+  else
+    warn "MaiBot 尚未完成首次启动（缺 data/webui.json），已跳过"
+    info "请先执行 install，再用 fg 前台确认一次协议"
+    rc=1
+  fi
+  if [ -f "$NAPCAT_ENV" ]; then
+    napcat_start || rc=1
+  else
+    warn "NapCat 尚未配置 QQ 号，已跳过"
+    info "请先执行 napcat-install，再 napcat-setup <QQ号>"
+    rc=1
+  fi
+  return "$rc"
+}
+
+allstop() {
+  say ""
+  say "${BOLD}===== 停止全部服务 =====${NC}"
+  stop
+  napcat_stop
+}
+
+watchdog() {
+  local interval="${1:-60}"
+  say ""
+  info "守护进程运行中：每 ${interval} 秒检查一次，掉线自动拉起"
+  local last_bot=0 last_nc=0 now
+  while true; do
+    now=$(date +%s 2>/dev/null || echo 0)
+    if [ -f "$BOT_DIR/data/webui.json" ] && ! is_running; then
+      if [ $((now - last_bot)) -ge 180 ]; then
+        warn "$(date '+%m-%d %H:%M:%S') MaiBot 掉线，自动拉起"
+        start
+        last_bot=$now
+      fi
+    fi
+    if [ -f "$NAPCAT_ENV" ] && ! napcat_running; then
+      if [ $((now - last_nc)) -ge 180 ]; then
+        warn "$(date '+%m-%d %H:%M:%S') NapCat 掉线，自动拉起"
+        napcat_start
+        last_nc=$now
+      fi
+    fi
+    sleep "$interval"
+  done
+}
+
+menu() {
+  while true; do
+    say ""
+    say "${BOLD}===== MaiBot + NapCat 菜单 =====${NC}"
+    say "  --- MaiBot ---"
+    say "  1)检查 2)部署 3)更新 4)启动 5)前台 6)停止 7)重启 8)状态 9)日志 10)密钥"
+    say "  --- NapCat ---"
+    say "  11)检查 12)安装 13)配置QQ 14)启动 15)停止 16)状态 17)登录码"
+    say "  --- 服务器模式 ---"
+    say "  18)启动全部 19)停止全部"
+    say "  --- 连接检查 ---"
+    say "  20)检测WebUI 21)配置适配器 22)适配器状态"
+    say "  0)退出"
+    printf '请输入 [0-22]：'
+    read -r n
+    case "$n" in
+      1) check;; 2) install;; 3) update;; 4) start;; 5) fg_run;; 6) stop;;
+      7) restart;; 8) status;; 9) logs;; 10) token;;
+      11) napcat_check;; 12) napcat_install;; 13) napcat_setup "${2:-}";; 14) napcat_start;;
+      15) napcat_stop;; 16) napcat_status;; 17) napcat_webui;;
+      18) allstart;; 19) allstop;;
+      20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;;
+      0|q|Q) say "再见"; break;; *) warn "无效输入";;
+    esac
+  done
+}
+
+# ---- 容器层参数分发 ----
+_MENU_RESULT=0
+case "$RUN_ACTION" in
+  check)          check ;;
+  install)        install ;;
+  update)         update ;;
+  start)          start ;;
+  fg)             fg_run ;;
+  stop)           stop ;;
+  restart)        restart ;;
+  status)         status ;;
+  logs)           logs ;;
+  token)          token ;;
+  allstart)       allstart ;;
+  allstop)        allstop ;;
+  wd|watchdog)    watchdog ;;
+  napcat-install) napcat_install ;;
+  napcat-setup)   napcat_setup "${2:-}" ;;
+  napcat-start)   napcat_start ;;
+  napcat-stop)    napcat_stop ;;
+  napcat-status)  napcat_status ;;
+  napcat-check)   napcat_check ;;
+  napcat-webui)   napcat_webui ;;
+  webui)          webui ;;
+  webui-check)    webui_check ;;
+  adapter-setup)  adapter_setup "${2:-}" ;;
+  adapter-status) adapter_status ;;
+  menu|"")        menu ;;
+  *)              err "未知动作：$RUN_ACTION"; exit 2 ;;
+esac
+_MENU_RESULT=$?
+
+# EXIT trap 统一完成通信文件（Termux setup/容器执行/提前失败均覆盖）。
+exit "$_MENU_RESULT"
