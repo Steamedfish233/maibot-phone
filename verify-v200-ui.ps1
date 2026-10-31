@@ -83,9 +83,24 @@ if ($posGuide -lt 0 -or $posGithub -lt 0 -or $posStatus -lt 0 -or $posWebui -lt 
 }
 if ($posGuide -gt $posStatus) { Fail 'first-run wizard must come before the status section' }
 if ($posGithub -gt $posWebui) { Fail 'project + feedback link must come before the WebUI section' }
-if ($xmlText -notmatch 'v2\.0\.8"') { Fail 'install wizard header does not show the current version' }
-if ($xmlText -match 'v2\.0\.7"') { Fail 'install wizard header still shows the previous version' }
+if ($xmlText -notmatch 'v2\.0\.9"') { Fail 'install wizard header does not show the current version' }
+if ($xmlText -match 'v2\.0\.8"') { Fail 'install wizard header still shows the previous version' }
 Pass 'first-run wizard and project feedback are placed first'
+
+# The project/feedback block must invite users to star the repo (ASCII markers only:
+# this file is read as ANSI by Windows PowerShell).
+$ghButton = $doc.SelectSingleNode("//*[@android:id='@+id/btn_github']", $ns)
+if ($ghButton -eq $null) { Fail 'missing btn_github' }
+$androidNs = 'http://schemas.android.com/apk/res/android'
+$ghText = $ghButton.GetAttribute('text', $androidNs)
+if ($ghText -notmatch 'Star') { Fail 'the project button must invite users to star the repository' }
+$fbNode = $ghButton.NextSibling
+while ($fbNode -ne $null -and $fbNode.NodeType -ne 'Element') { $fbNode = $fbNode.NextSibling }
+if ($fbNode -eq $null) { Fail 'project + feedback block is missing its description' }
+$fbText = $fbNode.GetAttribute('text', $androidNs)
+if ($fbText -notmatch 'Star') { Fail 'project + feedback description must ask for a GitHub star' }
+if ($fbText -notmatch 'Steamedfish233/maibot-phone') { Fail 'feedback block must show the repository URL' }
+Pass 'project + feedback block asks for a GitHub star'
 
 # 3. MainActivity behaviour
 $main = Read-Text $mainPath
@@ -128,9 +143,9 @@ Pass 'installer script verifies WebUI over HTTP and configures the official adap
 
 # 5. version
 $gradle = Read-Text $gradlePath
-if (!$gradle.Contains('versionName = "2.0.8"')) { Fail 'versionName is not 2.0.8' }
-if (!$gradle.Contains('versionCode = 36')) { Fail 'versionCode is not 36' }
-Pass 'version 2.0.8 (36)'
+if (!$gradle.Contains('versionName = "2.0.9"')) { Fail 'versionName is not 2.0.9' }
+if (!$gradle.Contains('versionCode = 37')) { Fail 'versionCode is not 37' }
+Pass 'version 2.0.9 (37)'
 
 # 6. APK metadata when built
 $apk = Join-Path $root 'MaibotApp/app/build/outputs/apk/release/app-release.apk'
@@ -138,8 +153,8 @@ if (Test-Path -LiteralPath $apk) {
     $aapt2 = Join-Path $root 'android-sdk/build-tools/34.0.0/aapt2.exe'
     if (Test-Path -LiteralPath $aapt2) {
         $badging = & $aapt2 dump badging $apk 2>$null | Select-Object -First 1
-        if ($badging -notmatch "versionName='2.0.8'") { Fail "APK versionName mismatch: $badging" }
-        if ($badging -notmatch "versionCode='36'") { Fail "APK versionCode mismatch: $badging" }
+        if ($badging -notmatch "versionName='2.0.9'") { Fail "APK versionName mismatch: $badging" }
+        if ($badging -notmatch "versionCode='37'") { Fail "APK versionCode mismatch: $badging" }
         Pass 'APK version metadata'
     }
 }

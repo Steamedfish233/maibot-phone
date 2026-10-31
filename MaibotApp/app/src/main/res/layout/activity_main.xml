@@ -66,7 +66,7 @@
             </LinearLayout>
 
             <!-- 安装优先：下载后第一件事就是安装，所以向导放在最上面（其后是项目反馈） -->
-            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.8" />
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.9" />
 
             <TextView
                 android:id="@+id/tv_install_guide"
@@ -119,13 +119,13 @@
                 style="@style/OutlinedBtn"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="打开项目 GitHub 主页" />
+                android:text="打开项目主页（Star ⭐ / 反馈 Issues）" />
 
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="github.com/Steamedfish233/maibot-phone\n使用问题、建议或 Bug 请在仓库的 Issues 中反馈。本项目不是 MaiBot / NapCat / Termux 官方项目。"
+                android:text="github.com/Steamedfish233/maibot-phone\n如果这个工具帮你顺利跑起了麦麦，欢迎在仓库右上角点一个 ⭐ Star 支持下作者 —— 这是最直接的鼓励，也能让更多有需要的人看到它。\n使用问题、建议或 Bug 请在 Issues 中反馈。本项目不是 MaiBot / NapCat / Termux 官方项目。"
                 android:textColor="@color/subtitle"
                 android:textSize="11sp" />
 

@@ -4,6 +4,8 @@
 
 App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务拉起来、把 **MaiBot WebUI** 和 **NapCat WebUI** 用手机浏览器打开，并把 QQ 适配器接到 NapCat 上。
 
+> ⭐ 如果这个工具帮你顺利跑起了麦麦，欢迎在仓库右上角点一个 **Star** —— 这是对作者最直接的鼓励，也能让更多有需要的人看到它。
+
 > v2.0.0 起移除了此前「在 App 内重做 WebUI」的实验方案（原生管理页 / 内嵌 WebView / 内置插件管理），恢复为 1.6.x 的单页布局并重新排版。
 > v2.0.1 把界面上的「联系作者 QQ」换成项目主页入口，问题统一到仓库 Issues。
 > v2.0.2 修复两个严重问题：`screen` 会话名改用精确匹配（此前守护会话 `.maibot-watchdog` 会被误判成 MaiBot 在运行，掩盖真正的故障）；HTTP 检测在没有 `curl` 时改用 `/dev/tcp` 兜底，且只要端口在监听就把地址交给浏览器，不再把可用 WebUI 误判成打不开。日志区从页面里移回独立底部面板，可单独滑动并自动跟随最新一行。
@@ -13,6 +15,7 @@ App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务�
 > v2.0.6 镜像连通性与界面顺序：安装前**逐个实测国内镜像**（Debian / PyPI / QQ CDN / GitHub 代理），不可达的直接跳过并在日志里说明，`apt`/`uv` 只在可用的源上重试；镜像候选扩到清华 / 阿里云 / 中科大 / 腾讯云 / 华为云 / 南大 / 上交，PyPI 增加腾讯云与华为云，新增 **Termux 菜单 27)镜像测速** 与诊断里的镜像可用性行；QQ 安装包换成 **官方 3.2.34-53644**（官方页面给的 3.2.18 地址已 404），已装 QQ 构建号低于 40768 时**自动重装**，NapCat 版本查询增加 GitHub 代理兜底；界面改为**安装优先**：首次安装向导与项目反馈提到最上面，服务状态 / WebUI / 适配器 / 保活居中，第 0-3 步与「打不开先点这里」在下方。
 > v2.0.7 **修掉「启动成功、一打开 WebUI 就报未运行」的根因**：`proot-distro login` 默认带 `--kill-on-exit`，login 一退出，本次 login 里启动的 screen / Xvfb / QQ / MaiBot 会被一起杀掉 —— 旧版本在容器里 `screen -dmS` 之后就让 login 退出，服务当然活不过那一次操作，容器里还留下一堆 Dead 空壳会话。现在改为**与 NapCat 官方 Termux 配方一致**：服务跑在本次 login 的前台，由 **Termux 侧的 screen 会话**托住整条 proot 进程链，停服务 = 结束该会话；守护进程也移到 Termux 层（App 被杀、容器重建都能自愈）。同时：NapCat 起不来时自动用 `NAPCAT_DISABLE_MULTI_PROCESS=1` 重试一次，失败会打印 **NapCat 自己的日志**与 QQ 退出码；修复被 `dpkg -i --force-depends` 弄坏的 apt 状态（`dpkg --configure -a` + `--fix-broken`，安装 QQ 改用 `apt` 解析依赖），新增回归测试 `verify-termux-services.ps1`。
 > v2.0.8 **修掉 NapCat「QQ 起来了但 NapCat 一行都不跑」**：旧的注入方式是覆盖 `/opt/QQ/resources/app/app_launcher/index.js`，而现在的 LinuxQQ 根本不再从那个文件启动 —— 于是 QQ 自己正常跑、NapCat 不加载，日志停在 Electron 的 IPC 初始化之后、没有 banner、6099 永不监听。现改为 **NapCat 官方安装器的做法**：NapCat 文件放进 `resources/app/app_launcher/napcat/`，在 `resources/app/` 写 `loadNapCat.js`（同时放一份 `.cjs`），并把 QQ `resources/app/package.json` 的 `main` 指向它，另外同步 `~/.config/QQ/versions/config.json`（QQ 升级后不会加载旧 resources 目录）；启动前先校验注入，没注入好就直接报错而不是干等 3 分钟。NapCat 失败时自动依次尝试 **普通 → `NAPCAT_DISABLE_MULTI_PROCESS=1` → 再加 `NAPCAT_FORCE_NODE_PROCESS=1`**，并在失败后自动跑一次容器内取证（QQ 日志开头/末尾去重、注入状态、NapCat 自己的 `logs/*.log`、进程列表）。修复 NapCat 日志被两个 tee 写两遍的问题，Termux 菜单新增 `28)重注入NapCat 29)NapCat现场诊断`，回归测试覆盖注入结果（loader 文件、`main` 字段、文件复制）。
+> v2.0.9 「项目与反馈」里加上请用户点 ⭐ Star 的说明（按钮改成「打开项目主页（Star ⭐ / 反馈 Issues）」），README 顶部也加了一句；功能无变化。
 
 ## 功能
 
@@ -48,7 +51,7 @@ QQ → NapCat → 正向 WebSocket ws://127.0.0.1:3001 → 统一 QQ 连接器 �
 从 [Releases](../../releases) 或 `dist/` 目录下载 APK 安装：
 
 ```
-dist/MaiBot-OneKey-v2.0.8.apk
+dist/MaiBot-OneKey-v2.0.9.apk
 ```
 
 ## 服务是怎么常驻的
