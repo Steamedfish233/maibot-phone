@@ -506,7 +506,7 @@ if [ -n "${PREFIX:-}" ]; then
     say " 2) 主屏幕长按 → 添加小部件 → Termux:Widget → 拖到桌面"
     say " 3) 点桌面图标即可一键操作"
     say ""
-    say "推荐首次流程：一键部署MaiBot → 前台启动MaiBot(确认协议) → 启动MaiBot"
+    say "推荐首次流程：一键部署MaiBot → 启动MaiBot → 打开 MaiBot WebUI 配置模型"
     say "            → 安装NapCat → 配置QQ号 → 启动NapCat → NapCat登录码(扫码)"
     say "            → 最后执行「启动全部服务」进入 7×24 服务器模式"
     say ""
@@ -618,33 +618,64 @@ LOG_FILE="$BOT_DIR/logs/mai.log"
 # ---------- NapCat 配置 ----------
 NAPCAT_DIR="$HOME/NapCat.linux.arm64"
 NAPCAT_SCREEN="napcat"
+# Xvfb 单独一个会话：以前它挂在 QQ 的启动脚本里，QQ 一崩脚本就退出，
+# 显示 :1 跟着消失，之后每次启动都更难点亮。
+XVFB_SCREEN="napcat-xvfb"
 NAPCAT_LOG="$HOME/napcat.log"
 NAPCAT_ENV="$HOME/.env"
 LINUXQQ_URL="https://dldir1v6.qq.com/qqfile/qq/QQNT/Linux/QQ_3.2.18_250626_arm64_01.deb"
 NAPCAT_FALLBACK_VERSION="v4.18.28"
 NAPCAT_WS_PORT="3001"
+# QQ 是 Electron：容器里 --no-sandbox 必需。其余开关保持与官方 Termux 配方一致，
+# 需要额外加（如 --disable-gpu）时用环境变量 MAIBOT_QQ_FLAGS 覆盖即可，默认不动。
+QQ_LAUNCH_FLAGS="${MAIBOT_QQ_FLAGS:---no-sandbox --enable-logging=stderr}"
 
 # 运行状态不能只看 screen：用户也可能在前台/其他会话启动服务，或 screen 名称变更。
 # 8001 本机 TCP 可连接时也视为 MaiBot 活着，避免 WebUI 可用但 status 误报停止。
 maibot_port_open() {
   (exec 3<>/dev/tcp/127.0.0.1/8001) >/dev/null 2>&1
 }
-# screen 会话名必须精确匹配：否则 ".maibot" 会命中 ".maibot-watchdog"，
-# 让已经崩掉的 MaiBot 看起来"进程还在"，把真正的故障原因掩盖掉。
-screen_session_running() {
-  screen -ls 2>/dev/null | grep -qE "[.]${1}[[:space:]]"
-}
-is_running() {
-  screen_session_running "$SCREEN_NAME" || maibot_port_open
-}
 napcat_port_open() {
   local port="$1"
   (exec 3<>"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
 }
+# screen 会话名必须精确匹配：否则 ".maibot" 会命中 ".maibot-watchdog"，
+# 让已经崩掉的 MaiBot 看起来"进程还在"，把真正的故障原因掩盖掉。
+# 还要区分 Dead 会话：进程早退了、只剩空壳（手机/容器重启后最常见），
+# screen -ls 照样列出来，旧实现当成"在运行"，于是「启动」直接返回、
+# WebUI 永远起不来 —— 这就是"以前能用、现在不动"的现场。
+screen_session_state() {
+  local name="$1" line
+  line=$(screen -ls 2>/dev/null | grep -E "[.]${name}[[:space:]]" | head -1)
+  [ -n "$line" ] || { printf 'none'; return 0; }
+  case "$line" in
+    *Dead*) printf 'dead' ;;
+    *)      printf 'live' ;;
+  esac
+}
+screen_session_running() {
+  [ "$(screen_session_state "$1")" = live ]
+}
+# 清理空壳会话：Dead 的会话 -X quit 是无效的，必须先 -wipe 让 screen 回收。
+screen_wipe_dead() {
+  screen -wipe >/dev/null 2>&1 || true
+}
+# 结束一个会话，并顺手回收它留下的空壳。
+screen_drop() {
+  screen -S "$1" -X quit >/dev/null 2>&1 || true
+  screen_wipe_dead
+}
+maibot_process_running() {
+  pgrep -f 'bot\.py' >/dev/null 2>&1
+}
+is_running() {
+  maibot_port_open || maibot_process_running || screen_session_running "$SCREEN_NAME"
+}
 napcat_running() {
-  screen_session_running "$NAPCAT_SCREEN" \
+  qq_process_running \
     || napcat_port_open 6099 \
-    || napcat_port_open "$NAPCAT_WS_PORT"
+    || napcat_port_open "$NAPCAT_WS_PORT" \
+    || screen_session_running "$NAPCAT_SCREEN"
 }
 # WebUI 到底有没有监听，比"进程在不在"更重要：MaiBot 崩了但守护会话还在时，
 # 只有端口能说明 WebUI 是否真的可用。
@@ -784,12 +815,13 @@ install_uv() {
   have pip && pipcmd="pip"
   [ -z "$pipcmd" ] && have pip3 && pipcmd="pip3"
   if [ -n "$pipcmd" ]; then
-    if UV_INDEX_URL="$PY_INDEX_URL" run_logged "$pipcmd" install --user -U uv --break-system-packages; then
+    # pip 只认 PIP_INDEX_URL；UV_* 变量对 pip 无效（旧版本写错了，等于直连 PyPI）
+    if PIP_INDEX_URL="$PY_INDEX_URL" run_logged "$pipcmd" install --user -U uv --break-system-packages; then
       export PATH="$HOME/.local/bin:$PATH"
       have uv && { ok "uv 安装完成（PyPI 镜像）"; return 0; }
     fi
     # 老版本 pip 不认识 --break-system-packages，去掉该参数再试一次
-    UV_INDEX_URL="$PY_INDEX_URL" run_logged "$pipcmd" install --user -U uv || true
+    PIP_INDEX_URL="$PY_INDEX_URL" run_logged "$pipcmd" install --user -U uv || true
     export PATH="$HOME/.local/bin:$PATH"
     have uv && { ok "uv 安装完成（PyPI 镜像）"; return 0; }
   else
@@ -843,7 +875,7 @@ install_deps() {
       || { err "虚拟环境创建失败（确认已安装 python3：apt install python3 python3-venv）"; return 1; }
   fi
   info "安装 Python 依赖（约数百 MB，走阿里云 PyPI 镜像，请耐心等待）..."
-  if UV_INDEX_URL="$PY_INDEX_URL" UV_PYTHON_DOWNLOADS=never run_logged uv sync; then
+  if UV_DEFAULT_INDEX="$PY_INDEX_URL" UV_INDEX_URL="$PY_INDEX_URL" UV_PYTHON_DOWNLOADS=never run_logged uv sync; then
     ok "Python 依赖安装完成"
     return 0
   fi
@@ -863,7 +895,7 @@ install() {
   mkdir -p "$BOT_DIR/logs" "$BOT_DIR/data"
   say ""
   ok "MaiBot 部署完成"
-  info "下一步：bash $0 fg 前台启动确认协议（仅首次），之后用 start"
+  info "下一步：点「启动 MaiBot」，然后在 WebUI 里配置模型密钥"
   info "WebUI：http://127.0.0.1:8001   密钥：bash $0 token"
 }
 
@@ -877,7 +909,7 @@ update() {
   info "拉取代码 ..."
   git pull --ff-only || { err "拉取失败"; return 1; }
   info "更新依赖 ..."
-  UV_INDEX_URL="$PY_INDEX_URL" uv sync || { err "依赖更新失败"; return 1; }
+  UV_DEFAULT_INDEX="$PY_INDEX_URL" UV_INDEX_URL="$PY_INDEX_URL" uv sync || { err "依赖更新失败"; return 1; }
   ok "更新完成，用 start 启动"
 }
 
@@ -894,8 +926,8 @@ sync_deps() {
     if [ -n "$url" ]; then label="$url"; else label="官方 PyPI"; fi
     info "同步依赖（$label，首次或网络慢时可能要几分钟）..."
     if [ -n "$url" ]; then
-      run_logged env UV_INDEX_URL="$url" uv sync --frozen && { ok "依赖已同步"; return 0; }
-      run_logged env UV_INDEX_URL="$url" uv sync && { ok "依赖已同步"; return 0; }
+      run_logged env UV_DEFAULT_INDEX="$url" UV_INDEX_URL="$url" uv sync --frozen && { ok "依赖已同步"; return 0; }
+      run_logged env UV_DEFAULT_INDEX="$url" UV_INDEX_URL="$url" uv sync && { ok "依赖已同步"; return 0; }
     else
       run_logged uv sync --frozen && { ok "依赖已同步"; return 0; }
       run_logged uv sync && { ok "依赖已同步"; return 0; }
@@ -915,56 +947,111 @@ fix_deps() {
     info "先停止 MaiBot 再修依赖"
     stop
   fi
+  # 上一次卡死在 uv sync / uv run 的进程要清掉，否则它会一直占着 .venv 写锁
+  stop_maibot
   sync_deps || return 1
   ok "依赖已修复，回到 App 点「启动 MaiBot」"
 }
 
-# 只给出一条命令，便于用户手动确认依赖是否真的卡住
+# 真正停掉 MaiBot：会话、bot.py，以及可能卡住的 uv（旧版本会永远停在 Building）
+stop_maibot() {
+  screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1 || true
+  pkill -f 'bot\.py' 2>/dev/null || true
+  pkill -f 'uv (sync|run)' 2>/dev/null || true
+  screen_wipe_dead
+  return 0
+}
+
+# 启动 MaiBot。
+# 关键：不要用 `uv run` 启动。uv 运行前会同步环境并构建/安装项目本身
+# （日志里只有一行 "Building maibot @ file://..."）；构建后端要走 build isolation
+# 下载 setuptools，国内经常直接卡死，于是永远起不来、8001 永远不监听。
+# 依赖已经 uv sync 过，这里直接复刻 uv run 的运行环境（VIRTUAL_ENV / PATH / .env），
+# 用虚拟环境解释器启动，全程不联网、不构建。
 start() {
   [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
   if [ ! -f "$BOT_DIR/data/webui.json" ]; then
-    warn "首次启动需前台确认协议：bash ~/maibot-onekey.sh fg"; return 1
+    # 新版 MaiBot 不再需要前台确认协议，webui.json 由 WebUI 服务启动时生成。
+    # 这里只提示、不拦截：拦下来只会让「启动」永远点不动。
+    warn "还没有 data/webui.json（首次启动会由 MaiBot 自己生成）"
+    info "启动后用「查看密钥」或 bash $0 token 取 WebUI 登录密钥"
   fi
-  is_running && { warn "MaiBot 已在运行"; return 0; }
+  if maibot_port_open; then
+    ok "MaiBot 已在运行，WebUI http://127.0.0.1:8001"
+    return 0
+  fi
+  # 会话在、8001 却没监听：要么卡在依赖构建，要么只是重启后留下的空壳。
+  # 旧版本在这里直接说"已在运行"就返回，用户怎么点都起不来。
+  screen_wipe_dead
+  if screen_session_running "$SCREEN_NAME" || maibot_process_running; then
+    warn "检测到旧的 MaiBot 会话/进程，但 8001 没在监听，先清理再启动"
+    stop_maibot
+  fi
   mkdir -p "$BOT_DIR/logs"
   info "虚拟环境：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失，将由 uv sync 创建)"
   sync_deps || return 1
+  if [ ! -f "$BOT_DIR/bot.py" ]; then
+    err "找不到 $BOT_DIR/bot.py，源码不完整：点「更新 MaiBot」或重新部署"
+    return 1
+  fi
   cd "$BOT_DIR" || return 1
-  # --no-sync：依赖刚同步过，启动时不要再触发一次构建，否则又会卡在 Building
-  screen -dmS "$SCREEN_NAME" bash -c "uv run --no-sync python bot.py 2>&1 | tee '$LOG_FILE'"
-  info "等待 WebUI 监听 8001（最多 90 秒）..."
-  local waited=0
-  while [ "$waited" -lt 90 ]; do
+  local launch
+  if [ -x "$BOT_DIR/.venv/bin/python" ]; then
+    # PYTHONUNBUFFERED：输出经 tee 落盘，不设的话日志会攒在缓冲区里，看不出进度
+    launch="cd '$BOT_DIR' || exit 1; export VIRTUAL_ENV='$BOT_DIR/.venv' PATH='$BOT_DIR/.venv/bin':\$PATH PYTHONUNBUFFERED=1 PYTHONUTF8=1; if [ -f .env ]; then set -a; . ./.env; set +a; fi; '$BOT_DIR/.venv/bin/python' -u bot.py"
+  else
+    warn "虚拟环境里没有 Python 解释器，退回 uv run（会重新同步，可能很慢）"
+    launch="cd '$BOT_DIR' || exit 1; PYTHONUNBUFFERED=1 env UV_DEFAULT_INDEX='$PY_INDEX_URL' UV_INDEX_URL='$PY_INDEX_URL' uv run --no-sync python bot.py"
+  fi
+  # 把真正执行的命令行写进日志：以后排查不用再猜用的是哪种启动方式
+  info "启动命令：$launch"
+  screen -dmS "$SCREEN_NAME" bash -c "$launch 2>&1 | tee '$LOG_FILE'"
+  info "等待 WebUI 监听 8001（最多 120 秒）..."
+  local waited=0 seen=0
+  while [ "$waited" -lt 120 ]; do
     sleep 1
     waited=$((waited + 1))
     maibot_port_open && break
-    screen_session_running "$SCREEN_NAME" || break
+    # 刚拉起的一瞬间进程还没建出来，所以"见过它活着、之后又消失"才算真失败
+    if maibot_process_running || screen_session_running "$SCREEN_NAME"; then
+      seen=1
+    elif [ "$seen" = 1 ]; then
+      break
+    fi
   done
   if maibot_port_open; then
     ok "MaiBot 已启动，WebUI http://127.0.0.1:8001"
-  elif screen_session_running "$SCREEN_NAME"; then
-    warn "进程在运行，但 90 秒内 8001 仍未监听"
-    info "最近的日志（若一直停在 Resolved/Building，就是依赖或网络问题）："
-    webui_log_tail "$LOG_FILE" 25
-    info "处理：点「停止 MaiBot」→「修复依赖」→「启动 MaiBot」"
-  else
-    err "启动失败，日志末尾："
-    webui_log_tail "$LOG_FILE" 25
-    return 1
+    return 0
   fi
+  if maibot_process_running; then
+    warn "进程在运行，但 120 秒内 8001 仍未监听"
+  else
+    err "MaiBot 进程已退出，启动失败"
+  fi
+  info "本地日志末尾（${LOG_FILE}）："
+  webui_log_tail "$LOG_FILE" 25
+  info "处理：点「修复依赖」→「启动 MaiBot」；仍不行点「连接诊断」并把输出发出来"
+  return 1
 }
 
 fg_run() {
   [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
   cd "$BOT_DIR" || return 1
-  info "前台启动（确认协议后 Ctrl+C 退出）..."
-  uv run python bot.py
+  info "前台启动（按住 Ctrl+C 退出；想看报错时用这个）..."
+  if [ -x "$BOT_DIR/.venv/bin/python" ]; then
+    PYTHONUNBUFFERED=1 "$BOT_DIR/.venv/bin/python" -u bot.py
+  else
+    uv run python bot.py
+  fi
 }
 
 stop() {
-  is_running || { warn "MaiBot 未运行"; return 0; }
-  screen -S "$SCREEN_NAME" -X quit >/dev/null 2>&1
-  sleep 1; pkill -f "python bot.py" 2>/dev/null
+  if ! is_running; then
+    warn "MaiBot 未运行"
+    screen_wipe_dead
+    return 0
+  fi
+  stop_maibot
   ok "MaiBot 已停止"
 }
 
@@ -1099,21 +1186,29 @@ doctor() {
   info "容器内 HOME：$HOME"
   say ""
   say "--- MaiBot ---"
-  info "screen 会话 $SCREEN_NAME：$(screen_session_running "$SCREEN_NAME" && echo 有 || echo 无)"
-  info "守护会话 maibot-watchdog：$(screen_session_running maibot-watchdog && echo 有 || echo 无)"
+  # live=里面真的有进程；dead=进程早退了只剩空壳（旧版本会误判成"在运行"）；none=没有
+  info "screen 会话 $SCREEN_NAME：$(screen_session_state "$SCREEN_NAME")"
+  info "守护会话 maibot-watchdog：$(screen_session_state maibot-watchdog)"
+  info "bot.py 进程：$(maibot_process_running && echo 有 || echo 无)"
   info "8001 端口：$(maibot_port_open && echo 已监听 || echo 未监听)"
   info "虚拟环境 .venv：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失)"
   info "uv：$(uv --version 2>/dev/null || echo 不可用)"
+  info "首次配置 data/webui.json：$([ -f "$BOT_DIR/data/webui.json" ] && echo 已有 || echo 缺失，首次成功启动后自动生成)"
   if maibot_port_open; then
     info "HTTP 状态码：$(webui_http_code 'http://127.0.0.1:8001/')"
   fi
-  info "日志：${LOG_FILE}"
-  webui_log_tail "$LOG_FILE" 12
+  if [ -f "$LOG_FILE" ]; then
+    info "日志：${LOG_FILE}（$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ') 行，最后写入 $(date -r "$LOG_FILE" '+%m-%d %H:%M' 2>/dev/null || echo 未知)）"
+  else
+    info "日志：${LOG_FILE}（文件不存在）"
+  fi
+  webui_log_tail "$LOG_FILE" 15
   say ""
   say "--- NapCat ---"
-  info "screen 会话 $NAPCAT_SCREEN：$(screen_session_running "$NAPCAT_SCREEN" && echo 有 || echo 无)"
+  info "screen 会话 $NAPCAT_SCREEN：$(screen_session_state "$NAPCAT_SCREEN")"
+  info "Xvfb 会话 $XVFB_SCREEN：$(screen_session_state "$XVFB_SCREEN")"
   info "QQ 进程：$(qq_process_running && echo 有 || echo 无)"
-  info "Xvfb 显示 :1：$(pgrep -f 'Xvfb :1' >/dev/null 2>&1 && echo 有 || echo 无)"
+  info "Xvfb 显示 :1：$(xvfb_running && echo 有 || echo 无)"
   info "相关进程（最多 6 行）："
   ps -ef 2>/dev/null | grep -E 'qq|Xvfb|bot\.py' | grep -v grep | head -6 | while IFS= read -r l; do info "$l"; done
   local open_ports="" p
@@ -1123,14 +1218,39 @@ doctor() {
   [ -n "$open_ports" ] && info "WebUI 端口：$open_ports" || info "WebUI 端口：6099-6199 都没有监听"
   info "WS 端口 $NAPCAT_WS_PORT：$(napcat_port_open "$NAPCAT_WS_PORT" && echo 已监听 || echo 未监听)"
   info "日志：${NAPCAT_LOG}"
-  webui_log_tail "$NAPCAT_LOG" 12
+  webui_log_tail "$NAPCAT_LOG" 15
+  # QQ 是 Electron：/dev/shm 不可用时会静默崩在启动阶段，这里直接给出证据
+  info "/dev/shm：$(ls -ld /dev/shm 2>/dev/null || echo 不存在)｜可用空间 $(df -h /dev/shm 2>/dev/null | tail -1 | awk '{print $4}' || echo 未知)"
+  info "内存（MB）：$(free -m 2>/dev/null | sed -n '2p' | tr -s ' ' || echo 未知)"
+  say "  -- QQ 现场证据（preload 之后静默退出时看这里）--"
+  local qqver qqbuild
+  if [ -f /opt/QQ/resources/app/package.json ] && have jq; then
+    qqver=$(jq -r '.version // empty' /opt/QQ/resources/app/package.json 2>/dev/null)
+    info "QQ 版本：${qqver:-未知}"
+  fi
+  if qqbuild=$(qq_build_version); then
+    if [ "$qqbuild" -lt 40768 ]; then
+      warn "QQ 构建号 $qqbuild 低于 NapCat 官方要求的 40768（推荐 3.2.34-53644）→ 建议重装 NapCat/QQ"
+    else
+      info "QQ 构建号：$qqbuild"
+    fi
+  fi
+  info "X 锁残留：$([ -e /tmp/.X1-lock ] && echo 有（会挡住 Xvfb 启动，已自动清理）|| echo 无)｜/tmp/.X11-unix：$(ls /tmp/.X11-unix 2>/dev/null | tr '\n' ' ' || echo 无)"
+  [ -f "$XVFB_LOG" ] && { info "Xvfb 日志末尾："; webui_log_tail "$XVFB_LOG" 5; }
+  local missing=""
+  for f in /opt/QQ/qq /opt/QQ/resources/app/wrapper.node; do
+    [ -f "$f" ] || continue
+    missing="$missing$(ldd "$f" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ')"
+  done
+  [ -n "$missing" ] && warn "缺失动态库：$missing（QQ 会在启动阶段直接崩，需要补依赖）" || info "动态库：/opt/QQ 依赖完整"
+  [ -d "$HOME/.config/QQ/crash_files" ] && info "崩溃转储：$(ls -t "$HOME/.config/QQ/crash_files" 2>/dev/null | head -3 | tr '\n' ' ')"
   say ""
   say "--- 为什么会变成这样 ---"
   # Dead 会话 = 进程早就退了，只剩空壳；这正是"以前能用、现在不动"的典型现场
   local dead=0
   screen -ls 2>/dev/null | grep -q 'Dead' && dead=1
   screen -ls 2>/dev/null | while IFS= read -r l; do info "$l"; done
-  [ "$dead" = 1 ] && warn "有 Dead 会话：进程早已退出，只剩空壳（旧版本会把它当成'运行中'）"
+  [ "$dead" = 1 ] && warn "有 Dead 会话：进程早已退出，只剩空壳（旧版本会把它当成'运行中'，于是点「启动」没反应）"
   if [ -x "$BOT_DIR/.venv/bin/python" ]; then
     info "venv Python：$("$BOT_DIR/.venv/bin/python" -V 2>&1)"
   else
@@ -1142,12 +1262,19 @@ doctor() {
   [ -f "$BOT_DIR/.git/FETCH_HEAD" ] && info "最近一次更新代码：$(date -r "$BOT_DIR/.git/FETCH_HEAD" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 未知)"
   info "NapCat 目录：$([ -d "$NAPCAT_DIR" ] && echo 存在 || echo 缺失)"
   info "QQ 程序 /opt/QQ/qq：$([ -x /opt/QQ/qq ] && echo 存在 || echo 缺失)"
+  info "NapCat 注入的启动器：$(grep -c 'napcat\.mjs' /opt/QQ/resources/app/app_launcher/index.js 2>/dev/null | tr -d ' ') 处引用（0=没注入成功，重装 NapCat）"
   info "磁盘：$(df -h /root 2>/dev/null | tail -1)"
   say ""
   say "--- 适配器 ---"
   adapter_status
   say ""
   info "结论：MaiBot 需要「8001 已监听」，NapCat 需要「WebUI 端口已监听 + 3001 已监听」"
+  if [ "$(screen_session_state "$SCREEN_NAME")" = dead ] || [ "$(screen_session_state "$NAPCAT_SCREEN")" = dead ]; then
+    info "行动建议：直接点「启动 MaiBot」/「启动 NapCat」即可，新版会自动清掉这些空壳会话再启动"
+  fi
+  if grep -q 'QQ 进程已退出' "$NAPCAT_LOG" 2>/dev/null; then
+    info "NapCat 日志里有 QQ 退出码：139=段错误，137=内存不足/被杀，可据此判断崩溃原因"
+  fi
   return 0
 }
 
@@ -1190,11 +1317,12 @@ napcat_install() {
   apt_install libnss3 libnotify4 libsecret-1-0 libgbm1 libasound2 \
     fonts-wqy-zenhei gnutls-bin libglib2.0-dev libdbus-1-3 libgtk-3-0 \
     libxss1 libxtst6 libatspi2.0-0 libx11-xcb1 ffmpeg unzip jq curl xvfb \
+    xauth libgssapi-krb5-2 libatk1.0-0 \
     || { err "依赖安装失败，可重试（已下载部分会复用）"; return 1; }
 
   step "安装 Linux QQ"
-  if [ -f "/opt/QQ/qq" ]; then
-    ok "Linux QQ 已安装，跳过"
+  if [ -f "/opt/QQ/qq" ] && [ "${MAIBOT_QQ_REINSTALL:-0}" != "1" ]; then
+    ok "Linux QQ 已安装，跳过（QQ 太旧时用菜单 26 重装：NapCat 要求构建号 ≥40768）"
   else
     # 腾讯 CDN 在部分手机网络/代理下不可达。先保留官方动态地址，
     # 再从维护 QQ 官方安装包归档的 GitHub release 动态选 arm64 deb。
@@ -1253,6 +1381,20 @@ napcat_install() {
       ok "Linux QQ 安装完成（已补齐依赖）"
     fi
     rm -f /tmp/linuxqq.deb
+    # dpkg -i --force-depends 会跳过依赖：缺库时 QQ 会在启动阶段静默崩掉，
+    # 所以这里立刻检查一次，把问题在安装阶段就暴露出来。
+    local misslib=""
+    for f in /opt/QQ/qq /opt/QQ/resources/app/wrapper.node; do
+      [ -f "$f" ] || continue
+      misslib="$misslib$(ldd "$f" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ')"
+    done
+    if [ -n "$misslib" ]; then
+      warn "QQ 仍缺少动态库：$misslib"
+      info "已在尝试补齐：apt-get install -y -f"
+      run_logged apt-get install -y -f || warn "补依赖失败，可稍后重试"
+    else
+      ok "QQ 动态库完整"
+    fi
   fi
 
   step "下载 NapCat（带进度条）"
@@ -1391,59 +1533,129 @@ qq_process_running() {
     || pgrep -x qq >/dev/null 2>&1
 }
 
+xvfb_running() {
+  pgrep -f 'Xvfb :1' >/dev/null 2>&1
+}
+
+XVFB_LOG="$HOME/xvfb.log"
+
+# Xvfb 用独立会话常驻：QQ 崩了它还在，重新启动 NapCat 时不用再等显示就绪。
+# 崩过之后 /tmp/.X1-lock 会残留，不清掉 Xvfb 会直接拒绝启动（这是"以前能用、
+# 现在显示起不来"的常见原因）。
+ensure_xvfb() {
+  xvfb_running && return 0
+  rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null || true
+  screen_drop "$XVFB_SCREEN"
+  screen -dmS "$XVFB_SCREEN" bash -c "ulimit -c 0 2>/dev/null; Xvfb :1 -screen 0 1080x760x16 +extension GLX +render > '$XVFB_LOG' 2>&1"
+  local waited=0
+  while [ "$waited" -lt 15 ]; do
+    sleep 1
+    waited=$((waited + 1))
+    xvfb_running && { ok "虚拟显示 Xvfb :1 已就绪"; return 0; }
+  done
+  warn "Xvfb :1 没能起来（QQ 需要它才能显示扫码界面），日志末尾："
+  webui_log_tail "$XVFB_LOG" 8
+  return 1
+}
+
+# QQ 版本：NapCat 官方要求最低构建号 40768，过旧的 QQ 会在启动阶段静默崩。
+qq_build_version() {
+  local f="/opt/QQ/resources/app/package.json" v=""
+  [ -f "$f" ] || return 1
+  if have jq; then
+    v=$(jq -r '.buildVersion // empty' "$f" 2>/dev/null)
+  else
+    v=$(sed -n 's/.*"buildVersion"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9]\+\)"\{0,1\}.*/\1/p' "$f" 2>/dev/null | head -1)
+  fi
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$v"
+}
+
 napcat_start() {
   [ -d "$NAPCAT_DIR" ] || { err "NapCat 未装"; return 1; }
   [ -f "$NAPCAT_ENV" ] || { warn "先 napcat-setup <QQ号>"; return 1; }
-  napcat_running && { warn "NapCat 已在运行"; return 0; }
+  [ -f "$NAPCAT_DIR/napcat.mjs" ] || { err "NapCat 文件不完整，先点「安装 NapCat」"; return 1; }
   source "$NAPCAT_ENV"
+  # 端口在监听 = 真的活着，直接返回，别把正在登录的 QQ 踢掉。
+  if napcat_port_open 6099 || napcat_port_open "$NAPCAT_WS_PORT"; then
+    warn "NapCat 已在运行"
+    return 0
+  fi
+  if qq_process_running; then
+    warn "QQ 进程在，但 WebUI 端口（6099）和 WS 端口（$NAPCAT_WS_PORT）都没监听"
+    info "可能还在启动或已卡死：等 30 秒再点一次；仍不行先「停止 NapCat」再启动"
+    return 1
+  fi
+  # 会话在、进程没了（手机/容器重启后最常见的空壳）→ 清掉再来，
+  # 否则旧版本会一直认为"NapCat 已在运行"。
+  screen_wipe_dead
+  screen_drop "$NAPCAT_SCREEN"
+  ensure_xvfb || true
   cat > "$NAPCAT_DIR/start_qq.sh" <<EOF
 #!/usr/bin/env bash
 export DISPLAY=:1
-# 屏幕必须先在，否则 Electron/QQ 起不来（日志会停在 preload 之后）
-if ! pgrep -f "Xvfb :1" >/dev/null 2>&1; then
-  Xvfb :1 -screen 0 1080x760x16 +extension GLX +render >/dev/null 2>&1 &
-  sleep 3
-fi
-cd "$NAPCAT_DIR"
-\$(command -v qq || echo /opt/QQ/qq) --no-sandbox -q "$ACCOUNT" 2>&1 | tee "$NAPCAT_LOG"
+export LANG=zh_CN.UTF-8
+# 崩溃时可能写出巨大的 core，手机存储会被写满（NapCat issue #2060）
+ulimit -c 0 2>/dev/null || true
+# ELECTRON_ENABLE_LOGGING：Electron/Chromium 自己的报错也进日志，
+# 否则"preload 之后什么都不打印"就永远查不出原因
+export ELECTRON_ENABLE_LOGGING=1
+cd "$NAPCAT_DIR" || exit 1
+QQBIN="\$(command -v qq || echo /opt/QQ/qq)"
+echo "[\$(date '+%F %T')] 启动 QQ：\$QQBIN $QQ_LAUNCH_FLAGS -q $ACCOUNT（DISPLAY=\$DISPLAY）" | tee -a "$NAPCAT_LOG"
+"\$QQBIN" $QQ_LAUNCH_FLAGS -q "$ACCOUNT" 2>&1 | tee -a "$NAPCAT_LOG"
+rc=\${PIPESTATUS[0]}
+sig=""
+[ "\$rc" -gt 128 ] 2>/dev/null && sig="（被信号 \$((rc - 128)) 杀死）"
+echo "[\$(date '+%F %T')] QQ 进程已退出，退出码 \$rc\$sig；139/134/132=原生崩溃，137=内存不足被杀，1=普通报错" | tee -a "$NAPCAT_LOG"
 EOF
   chmod +x "$NAPCAT_DIR/start_qq.sh"
-  # 清掉可能残留的旧会话，避免出现"会话在、QQ 早没了"的假象
-  screen -S "$NAPCAT_SCREEN" -X quit >/dev/null 2>&1
   : > "$NAPCAT_LOG" 2>/dev/null || true
   sync_napcat_config
   screen -dmS "$NAPCAT_SCREEN" "$NAPCAT_DIR/start_qq.sh"
-  local waited=0 webui_port=""
-  while [ "$waited" -lt 45 ]; do
+  local waited=0 webui_port="" seen=0
+  while [ "$waited" -lt 60 ]; do
     sleep 1
     waited=$((waited + 1))
     webui_port=$(napcat_webui_port 2>/dev/null || true)
     [ -n "$webui_port" ] && break
-    # 会话和进程都没了才算真的失败，别因为匹配不到进程名就提前放弃
-    if ! screen_session_running "$NAPCAT_SCREEN" && ! qq_process_running; then
+    if qq_process_running; then
+      seen=1
+    elif [ "$seen" = 1 ]; then
+      # QQ 起来过又没了：不用再等，日志里已经有退出码
       break
     fi
   done
   if [ -n "$webui_port" ]; then
     ok "NapCat 已启动，WebUI 端口：$webui_port"
     info "扫码：bash $0 napcat-webui"
-  else
-    err "NapCat 没能起来（WebUI 未监听），日志末尾："
-    webui_log_tail "$NAPCAT_LOG" 25
-    info "排查顺序：① 用「安装 NapCat」重装依赖 ② 确认 /opt/QQ/qq 存在 ③ 把上面的日志发出来"
-    return 1
+    return 0
   fi
+  err "NapCat 没能起来（WebUI 未监听），日志末尾："
+  webui_log_tail "$NAPCAT_LOG" 25
+  info "排查顺序：① 看日志里的「QQ 进程已退出，退出码」 ② 「安装 NapCat」重装依赖 ③ 执行 doctor 把输出发出来"
+  return 1
+}
+
+# 停 NapCat 本体（区分开：它不打印成功信息，方便内部复用）
+napcat_stop_core() {
+  screen_drop "$NAPCAT_SCREEN"
+  pkill -f "QQ/qq" 2>/dev/null || true
+  pkill -f "qq --no-sandbox" 2>/dev/null || true
+  pkill -x qq 2>/dev/null || true
+  screen_drop "$XVFB_SCREEN"
+  pkill -f "Xvfb :1" 2>/dev/null || true
+  screen_wipe_dead
+  return 0
 }
 
 napcat_stop() {
-  if ! napcat_running && ! qq_process_running; then
-    warn "NapCat 未运行"; return 0
+  if ! napcat_running; then
+    warn "NapCat 未运行"
+    screen_wipe_dead
+    return 0
   fi
-  screen -S "$NAPCAT_SCREEN" -X quit >/dev/null 2>&1
-  pkill -f "QQ/qq" 2>/dev/null
-  pkill -f "qq --no-sandbox" 2>/dev/null
-  pkill -x qq 2>/dev/null
-  pkill -f "Xvfb :1" 2>/dev/null
+  napcat_stop_core
   ok "NapCat 已停止"
 }
 
@@ -1716,11 +1928,11 @@ allstart() {
   say ""
   say "${BOLD}===== 启动全部服务 =====${NC}"
   local rc=0
-  if [ -f "$BOT_DIR/data/webui.json" ]; then
+  if [ -f "$BOT_DIR/bot.py" ]; then
     start || rc=1
   else
-    warn "MaiBot 尚未完成首次启动（缺 data/webui.json），已跳过"
-    info "请先执行 install，再用 fg 前台确认一次协议"
+    warn "MaiBot 尚未部署（缺 $BOT_DIR/bot.py），已跳过"
+    info "请先在 App 点「按顺序安装：Debian → MaiBot」"
     rc=1
   fi
   if [ -f "$NAPCAT_ENV" ]; then
@@ -1740,6 +1952,18 @@ allstop() {
   napcat_stop
 }
 
+# 一键清理残留：手机重启、容器重装或 QQ/uv 崩过之后，screen 里常留下空壳会话，
+# 或者有卡死的进程占着 .venv、端口。先清干净再启动，比反复点「启动」有效。
+reset_sessions() {
+  say ""
+  say "${BOLD}===== 清理残留会话与进程 =====${NC}"
+  stop_maibot
+  napcat_stop_core
+  screen_wipe_dead
+  ok "已清理 MaiBot / NapCat / Xvfb 的会话与残留进程"
+  info "接着点「启动 MaiBot」和「启动 NapCat」重新拉起即可"
+}
+
 watchdog() {
   local interval="${1:-60}"
   say ""
@@ -1747,7 +1971,7 @@ watchdog() {
   local last_bot=0 last_nc=0 now
   while true; do
     now=$(date +%s 2>/dev/null || echo 0)
-    if [ -f "$BOT_DIR/data/webui.json" ] && ! is_running; then
+    if [ -f "$BOT_DIR/bot.py" ] && ! is_running; then
       if [ $((now - last_bot)) -ge 180 ]; then
         warn "$(date '+%m-%d %H:%M:%S') MaiBot 掉线，自动拉起"
         start
@@ -1776,9 +2000,9 @@ menu() {
     say "  --- 服务器模式 ---"
     say "  18)启动全部 19)停止全部"
     say "  --- 连接检查 ---"
-    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖"
+    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖 25)清理残留 26)重装QQ"
     say "  0)退出"
-    printf '请输入 [0-24]：'
+    printf '请输入 [0-26]：'
     read -r n
     case "$n" in
       1) check;; 2) install;; 3) update;; 4) start;; 5) fg_run;; 6) stop;;
@@ -1787,6 +2011,7 @@ menu() {
       15) napcat_stop;; 16) napcat_status;; 17) napcat_webui;;
       18) allstart;; 19) allstop;;
       20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;; 23) doctor;; 24) fix_deps;;
+      25) reset_sessions;; 26) MAIBOT_QQ_REINSTALL=1 napcat_install;;
       0|q|Q) say "再见"; break;; *) warn "无效输入";;
     esac
   done
@@ -1809,6 +2034,7 @@ case "$RUN_ACTION" in
   allstop)        allstop ;;
   wd|watchdog)    watchdog ;;
   napcat-install) napcat_install ;;
+  napcat-qq)      MAIBOT_QQ_REINSTALL=1 napcat_install ;;
   napcat-setup)   napcat_setup "${2:-}" ;;
   napcat-start)   napcat_start ;;
   napcat-stop)    napcat_stop ;;
@@ -1819,6 +2045,7 @@ case "$RUN_ACTION" in
   webui-check)    webui_check ;;
   doctor)         doctor ;;
   fix-deps)       fix_deps ;;
+  reset)          reset_sessions ;;
   adapter-setup)  adapter_setup "${2:-}" ;;
   adapter-status) adapter_status ;;
   menu|"")        menu ;;

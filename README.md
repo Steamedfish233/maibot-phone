@@ -9,6 +9,7 @@ App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务�
 > v2.0.2 修复两个严重问题：`screen` 会话名改用精确匹配（此前守护会话 `.maibot-watchdog` 会被误判成 MaiBot 在运行，掩盖真正的故障）；HTTP 检测在没有 `curl` 时改用 `/dev/tcp` 兜底，且只要端口在监听就把地址交给浏览器，不再把可用 WebUI 误判成打不开。日志区从页面里移回独立底部面板，可单独滑动并自动跟随最新一行。
 > v2.0.3 解决「MaiBot 会话在、8001 永远不监听」：`start` 先显式 `uv sync` 再用 `uv run --no-sync` 启动（此前 `uv run` 卡在 Building 阶段，日志只剩一行），启动后等待 8001 并在失败时打印日志；新增「修复依赖」按钮。NapCat 启动前确保 Xvfb 在、并区分「会话残留」与「QQ 真在跑」；连接诊断补充虚拟环境、uv、Xvfb 与真实进程列表；修正适配器状态把 `qq_account` 行尾注释当成 QQ 号的解析错误。
 > v2.0.4 诊断增强：输出 `screen -ls` 原始内容并标出 **Dead 会话**（进程早已退出、只剩空壳，这是「以前能用、现在不动」的典型现场），检查 `.venv` 里的 Python 是否可用、`uv.lock` 是否比 `.venv` 新（说明依赖没同步完）、代码最后一次更新时间、NapCat / QQ 是否还在、剩余磁盘空间。依赖同步改为 **阿里云 → 清华 → 官方 PyPI** 依次回退。
+> v2.0.5 修复「会话在、WebUI 打不开、点启动没反应」：**Dead 空壳会话不再算作"正在运行"**（旧版本会让「启动 MaiBot」「启动 NapCat」直接返回，守护和掉线重启也一起失效），启动前自动 `screen -wipe` 清理；MaiBot 改用 **虚拟环境解释器直接启动**（不再 `uv run`，避免每次都卡在 `Building maibot @ ...`）；NapCat 的 Xvfb 改为独立会话常驻，启动前清理 `/tmp/.X1-lock`，`ulimit -c 0` 防止 core 写满存储，并在日志里记录 **QQ 真实退出码/信号**（139 段错误、137 内存不足）；诊断新增 QQ 构建号（NapCat 要求 ≥40768）、缺失动态库、`/dev/shm`、Xvfb 日志与崩溃转储；修复 Termux 菜单新增「25)清理残留 26)重装QQ」。
 
 ## 功能
 
@@ -44,7 +45,7 @@ QQ → NapCat → 正向 WebSocket ws://127.0.0.1:3001 → 统一 QQ 连接器 �
 从 [Releases](../../releases) 或 `dist/` 目录下载 APK 安装：
 
 ```
-dist/MaiBot-OneKey-v2.0.4.apk
+dist/MaiBot-OneKey-v2.0.5.apk
 ```
 
 ## 使用步骤
@@ -52,10 +53,11 @@ dist/MaiBot-OneKey-v2.0.4.apk
 1. 安装并首次打开 Termux，等它完成基础环境初始化。
 2. App 点 **修复 Termux 通信** → 允许「运行 Termux 命令」→ 在 Termux 里粘贴执行复制的命令 → 彻底退出 Termux 再打开。
 3. 点 **检查安装条件**，通过后点 **按顺序安装：Debian → MaiBot**。
-4. 首次启动需在 Termux 确认相关协议（前台运行一次）：
+4. （可选）首次想在终端里看着跑一次，可在 Termux 执行：
    ```bash
    bash ~/maibot-onekey.sh fg
    ```
+   新版 MaiBot 不再需要交互确认协议，直接回 App 点 **启动 MaiBot** 即可。
 5. 回到 App 点 **启动 MaiBot** → **打开 MaiBot WebUI**，登录并设置固定 Token、模型等。
 6. 填写机器人 QQ 号 → **保存 QQ 号**（同时写入 NapCat 正向 WS 3001）→ **安装 NapCat** → **启动 NapCat** → **打开 NapCat WebUI** 扫码登录。
 7. 在 **MaiBot WebUI → 插件管理** 里从 Git 安装：
@@ -66,6 +68,14 @@ dist/MaiBot-OneKey-v2.0.4.apk
 9. **停止 MaiBot → 启动 MaiBot** 让配置生效，点 **检测适配器连接状态** 确认链路。
 
 排查顺序：WebUI 能不能打开 → 适配器插件是否启用 → 3001 是否监听 → 两边 QQ 号是否一致 → 适配器访问策略是否放行该群。
+
+打不开 WebUI 时：先点 **连接诊断**，重点看三行——
+
+- `screen 会话 maibot` 显示 `dead`：手机重启后留下的空壳会话，直接点 **启动 MaiBot**，脚本会自己清掉再启动。
+- 日志停在 `Building maibot @ ...`：旧版本用 `uv run` 启动时卡在构建；v2.0.5 起改用虚拟环境解释器启动，不再出现。
+- `8001 端口：未监听` 且 mai.log 里有 Python 报错：按提示点 **修复依赖**，再把日志贴到 Issues。
+
+NapCat 起不来时，日志末尾会有 `QQ 进程已退出，退出码 N`：`139/134/132` 是原生崩溃，`137` 是被系统（内存不足）杀掉。诊断里会一并打印 QQ 构建号（NapCat 要求 ≥40768，过旧就重装 QQ）、缺失动态库和 `/dev/shm` 状况。Termux 菜单里另有 `25)清理残留` 与 `26)重装QQ`。
 
 ## 构建
 

@@ -224,7 +224,7 @@ object TaskSession {
             append("顺序安装已停止，不会继续后续步骤；处理错误后可重新安装。")
         }
         if (success && action == "install") {
-            append("下一步：打开 Termux，执行 bash ~/maibot-onekey.sh fg，阅读并确认首次协议；然后配置模型密钥。QQ 登录在 NapCat 中另行完成。")
+            append("下一步：点「启动 MaiBot」，再点「打开 MaiBot WebUI」登录并配置模型密钥。QQ 登录在 NapCat 中另行完成。")
         }
         if (chain) {
             append("Debian 初始化成功，接下来部署 MaiBot。")

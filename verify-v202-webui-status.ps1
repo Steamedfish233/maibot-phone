@@ -7,7 +7,13 @@ $text = [System.IO.File]::ReadAllText($source)
 
 # --- static checks: the start path must not rebuild dependencies on every launch ---
 if ($text -notmatch 'uv run --no-sync python bot\.py') {
-    throw 'start must launch with --no-sync so a stuck build cannot block the WebUI'
+    throw 'start must keep a --no-sync fallback instead of a plain uv run'
+}
+if ($text -match 'screen -dmS "\$SCREEN_NAME" bash -c "uv run --no-sync') {
+    throw 'start must not launch MaiBot through uv run: uv rebuilds the project and hangs on "Building ..."'
+}
+if ($text -notmatch "\.venv/bin/python' -u bot\.py") {
+    throw 'start must launch MaiBot with the virtualenv interpreter'
 }
 if ($text -notmatch '(?s)sync_deps\(\)\s*\{.*?uv sync --frozen.*?uv sync\b') {
     throw 'sync_deps must try the locked sync first and fall back'
@@ -16,9 +22,14 @@ if ($text -notmatch 'fix-deps\)\s+fix_deps') { throw 'fix-deps action must be ro
 if ($text -notmatch 'qq_process_running\(\)') { throw 'NapCat must detect the real QQ process' }
 if ($text -notmatch 'pypi\.tuna\.tsinghua\.edu\.cn') { throw 'dependency sync needs a mirror fallback chain' }
 if ($text -notmatch "'Dead'") { throw 'doctor must spot dead screen sessions' }
+if ($text -notmatch 'screen_session_state\(\)') { throw 'a Dead screen session must be distinguished from a live one' }
+if ($text -notmatch 'screen -wipe') { throw 'dead sessions must be reclaimed with screen -wipe' }
+if ($text -notmatch 'ensure_xvfb\(\)') { throw 'Xvfb must be managed in its own session' }
+if ($text -notmatch '\$\{PIPESTATUS\[0\]\}') { throw 'the QQ launch must log the real exit code via PIPESTATUS' }
 if ($text -notmatch 'uv\.lock" -nt') { throw 'doctor must compare uv.lock against .venv' }
-Write-Host 'PASS: start syncs deps first and launches with --no-sync'
+Write-Host 'PASS: start syncs deps first and launches with the virtualenv interpreter'
 Write-Host 'PASS: fix-deps action routed; QQ process detection present'
+Write-Host 'PASS: dead sessions are reclaimed instead of blocking start'
 Write-Host 'PASS: doctor reports dead sessions and unsynced dependencies'
 
 # ASCII-only on purpose: Windows PowerShell reads .ps1 as ANSI when there is no BOM,
@@ -33,13 +44,16 @@ err(){ echo "ERR:$*"; }
 RED=; GREEN=; YELLOW=; BLUE=; BOLD=; NC=
 SCREEN_NAME=maibot
 NAPCAT_SCREEN=napcat
+XVFB_SCREEN=napcat-xvfb
 NAPCAT_WS_PORT=3001
 '@
 
 # Extract the real functions in dependency order: tests run the shipped code,
 # not a copy of the logic.
-foreach ($fn in @('screen_session_running','maibot_port_open','is_running','napcat_port_open',
-                  'napcat_running','maibot_webui_state','napcat_webui_port','napcat_log_url',
+foreach ($fn in @('screen_session_state','screen_session_running','screen_wipe_dead','screen_drop',
+                  'maibot_port_open','maibot_process_running','is_running','napcat_port_open',
+                  'qq_process_running','xvfb_running','napcat_running','maibot_webui_state',
+                  'napcat_webui_port','napcat_log_url',
                   'webui_http_code','webui_http_ok','webui_log_tail','webui','webui_check','napcat_webui',
                   'adapter_plugin_dir','adapter_status')) {
     $startMarker = "`n" + $fn + "() {"
@@ -81,6 +95,18 @@ screen(){ printf 'There are screens on:\n\t222.maibot\t(Detached)\n'; }
 screen_session_running maibot || { echo "FAIL: real session not detected"; exit 1; }
 screen_session_running napcat && { echo "FAIL: napcat matched by maibot session"; exit 1; }
 echo "PASS: session name matched exactly"
+
+# 3b) A Dead session (process long gone, empty shell left) must NOT count as running:
+#     the old code returned "already running" and the start button did nothing.
+screen(){ printf 'There are screens on:\n\t333.maibot\t(Dead ???)\n\t334.napcat\t(Dead ???)\n'; }
+[ "$(screen_session_state maibot)" = dead ] || { echo "FAIL: dead session not classified"; exit 1; }
+[ "$(screen_session_state napcat)" = dead ] || { echo "FAIL: dead napcat session not classified"; exit 1; }
+[ "$(screen_session_state maibot-watchdog)" = none ] || { echo "FAIL: missing session not classified"; exit 1; }
+screen_session_running maibot && { echo "FAIL: dead session counted as running"; exit 1; }
+maibot_process_running(){ return 1; }
+maibot_port_open(){ return 1; }
+is_running && { echo "FAIL: is_running true with only a dead session"; exit 1; }
+echo "PASS: dead session no longer counts as running"
 
 # 4) session but no listener: report unavailable, never a dead link
 maibot_port_open(){ return 1; }
