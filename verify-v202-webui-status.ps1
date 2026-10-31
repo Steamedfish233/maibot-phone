@@ -53,7 +53,7 @@ NAPCAT_WS_PORT=3001
 foreach ($fn in @('screen_session_state','screen_session_running','screen_wipe_dead','screen_drop',
                   'maibot_port_open','maibot_process_running','is_running','napcat_port_open',
                   'qq_process_running','xvfb_running','napcat_running','maibot_webui_state',
-                  'napcat_webui_port','napcat_log_url',
+                  'napcat_webui_port','napcat_log_url','mirror_alive',
                   'webui_http_code','webui_http_ok','webui_log_tail','webui','webui_check','napcat_webui',
                   'adapter_plugin_dir','adapter_status')) {
     $startMarker = "`n" + $fn + "() {"
@@ -164,6 +164,21 @@ out=$(adapter_status 2>&1) || true
 echo "$out" | grep -q 'adapter fallback account' && { echo "FAIL: comment used as qq_account when empty"; exit 1; }
 echo "$out" | grep -q '3980556598' && { echo "FAIL: stale account still reported as configured"; exit 1; }
 echo "PASS: empty qq_account is not replaced by its comment"
+
+# 11) mirror probing: a 403/404 mirror must be skipped, a 200 mirror accepted.
+#     (Kept last: it redefines have/curl.)
+have(){ return 0; }
+curl(){
+  case "$*" in
+    *ok-mirror*) printf '200' ;;
+    *dead-mirror*) printf '403' ;;
+    *) printf '404' ;;
+  esac
+}
+mirror_alive 'https://ok-mirror/dists/bookworm/Release' || { echo "FAIL: 200 mirror rejected"; exit 1; }
+mirror_alive 'https://dead-mirror/dists/bookworm/Release' && { echo "FAIL: 403 mirror accepted"; exit 1; }
+mirror_alive 'https://missing-mirror/dists/bookworm/Release' && { echo "FAIL: 404 mirror accepted"; exit 1; }
+echo "PASS: mirror probe skips unreachable mirrors and keeps working ones"
 '@
 
 $temp = Join-Path $env:TEMP ('maibot-webui-status-' + [guid]::NewGuid().ToString('N') + '.sh')

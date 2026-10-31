@@ -115,21 +115,45 @@ STEP_NO=0; STEP_ALL=6
 step(){ STEP_NO=$((STEP_NO + 1)); _plain_log ""; _plain_log "===== [${STEP_NO}/${STEP_ALL}] $* ====="; }
 
 # ---------- 网络自检：连不通就直接给出明确原因，避免"跑很久没效果" ----------
+# 逐个探测安装真正会用到的国内镜像（Debian / PyPI / QQ CDN / GitHub 代理），
+# 不可达的会打 [注意]，后续步骤会自动跳过它们；一个都连不上才判定网络不通。
 net_check() {
-  info "检查网络连通性 ..."
-  local okcnt=0
-  for u in "https://mirrors.tuna.tsinghua.edu.cn" "https://mirrors.aliyun.com" "https://www.baidu.com"; do
-    if curl -sI --connect-timeout 8 -o /dev/null "$u"; then
+  info "检查网络与国内镜像连通性（逐个实测，约 10 秒）..."
+  local okcnt=0 total=0 item label url
+  for item in \
+    "清华 Debian|https://mirrors.tuna.tsinghua.edu.cn/debian/dists/bookworm/Release" \
+    "阿里云 Debian|https://mirrors.aliyun.com/debian/dists/bookworm/Release" \
+    "中科大 Debian|https://mirrors.ustc.edu.cn/debian/dists/bookworm/Release" \
+    "腾讯云 Debian|https://mirrors.cloud.tencent.com/debian/dists/bookworm/Release" \
+    "阿里云 PyPI|https://mirrors.aliyun.com/pypi/simple/pip/" \
+    "清华 PyPI|https://pypi.tuna.tsinghua.edu.cn/simple/pip/" \
+    "腾讯云 PyPI|https://mirrors.cloud.tencent.com/pypi/simple/pip/" \
+    "华为云 PyPI|https://mirrors.huaweicloud.com/repository/pypi/simple/pip/" \
+    "QQ 安装包 CDN|$LINUXQQ_URL" \
+    "GitHub 代理|${GITHUB_PROXY}" ; do
+    label="${item%%|*}"
+    url="${item#*|}"
+    total=$((total + 1))
+    if mirror_alive "$url"; then
       okcnt=$((okcnt + 1))
+      ok "$label：可达"
+    else
+      warn "$label：不可达（安装时会自动跳过该来源）"
     fi
   done
   if [ "$okcnt" -eq 0 ]; then
-    err "网络不通：无法访问任何镜像站点"
-    err "请检查手机是否联网、是否开了代理/VPN，然后重试"
+    err "所有镜像都连不上：请检查手机是否联网、是否开了代理/VPN，然后重试"
     return 1
   fi
-  ok "网络正常（$okcnt/3 个站点可达）"
+  ok "网络正常（$okcnt/$total 个镜像可达）"
   return 0
+}
+
+# 单独的"镜像连通性测试"入口（Termux 菜单 27 / bash $0 mirrors）
+mirrors_check() {
+  say ""
+  say "${BOLD}===== 镜像连通性测试 =====${NC}"
+  net_check
 }
 
 # ---------- 带进度条的下载（curl：断点续传 + 国内可达） ----------
@@ -205,17 +229,44 @@ dl() {
 }
 
 # ---------- 镜像加速 ----------
-# 每个下载环节都准备多个候选源。实测失效的地址不再使用：
-#   mirrors.wars.cat 的 termux 路径 404、gh-proxy.org 与 ghfast.top 不可达。
-TERMUX_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/termux https://mirror.sjtu.edu.cn/termux https://mirrors.pku.edu.cn/termux"
+# 每个下载环节都准备多个候选源，并在使用前做一次连通性探测（mirror_alive）：
+# 国内镜像经常出现「某个站被墙/被限流/路径变更」，固定顺序硬试会让安装卡很久。
+# 2026-10 实测（大陆网络，任选其一即可，脚本会自己挑可用的）：
+#   清华 mirrors.tuna.tsinghua.edu.cn   —— 部分网络会返回 403（被限流），所以只排第一但不依赖它
+#   阿里云 mirrors.aliyun.com           —— Debian / PyPI 均可达，PyPI 最快
+#   中科大 mirrors.ustc.edu.cn          —— Debian / Termux / PyPI 均可达
+#   腾讯云 mirrors.cloud.tencent.com    —— Debian / PyPI 可达
+#   华为云 repo.huaweicloud.com         —— Debian 可达；PyPI 走 /repository/pypi/simple
+#   南大 mirror.nju.edu.cn / 上交 mirror.sjtu.edu.cn / 北大 mirrors.pku.edu.cn
+# 已失效、不要再用：mirrors.wars.cat（404）、gh-proxy.org / ghfast.top（不可达）、
+#   dldir1v6.qq.com 上的 QQ_3.2.18 安装包（404，官方页面仍在引用旧地址）。
+TERMUX_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/termux https://mirrors.ustc.edu.cn/termux https://mirror.sjtu.edu.cn/termux https://mirrors.nju.edu.cn/termux https://mirrors.pku.edu.cn/termux https://mirrors.huaweicloud.com/termux"
 TERMUX_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/termux"
-# TUNA HTTPS → Aliyun HTTPS → HTTP mirrors as a last resort. HTTP still uses
-# Debian's signed Release metadata; never disable apt signature verification.
-DEBIAN_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/debian https://mirrors.aliyun.com/debian http://mirrors.aliyun.com/debian http://mirrors.tuna.tsinghua.edu.cn/debian"
-DEBIAN_SEC_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/debian-security https://mirrors.aliyun.com/debian-security http://mirrors.aliyun.com/debian-security http://mirrors.tuna.tsinghua.edu.cn/debian-security"
+# DEBIAN_MIRRORS 与 DEBIAN_SEC_MIRRORS 必须一一对应（按序号配对），新增时两边都要加。
+# HTTP 源放在最后：仍然使用 Debian 签名校验，绝不关闭 apt 的签名验证。
+DEBIAN_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/debian https://mirrors.aliyun.com/debian https://mirrors.ustc.edu.cn/debian https://mirrors.cloud.tencent.com/debian https://repo.huaweicloud.com/debian https://mirror.nju.edu.cn/debian https://mirror.sjtu.edu.cn/debian http://mirrors.aliyun.com/debian"
+DEBIAN_SEC_MIRRORS="https://mirrors.tuna.tsinghua.edu.cn/debian-security https://mirrors.aliyun.com/debian-security https://mirrors.ustc.edu.cn/debian-security https://mirrors.cloud.tencent.com/debian-security https://repo.huaweicloud.com/debian-security https://mirror.nju.edu.cn/debian-security https://mirror.sjtu.edu.cn/debian-security http://mirrors.aliyun.com/debian-security"
 DEBIAN_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/debian"
+# PyPI：阿里云最快，清华次之（部分网络 403），其余作兜底
+PYPI_MIRRORS="https://mirrors.aliyun.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple https://mirrors.cloud.tencent.com/pypi/simple https://mirrors.huaweicloud.com/repository/pypi/simple https://mirrors.ustc.edu.cn/pypi/simple"
 # GitHub 直连之外的代理（唯一实测可用者；gh-proxy.org / ghfast.top 均已失效）
 GITHUB_PROXY="https://gh-proxy.com/"
+# NapCat 官方要求 Linux QQ 构建号 >= 40768；3.2.34-53644 是官方安装器钉住的版本，
+# 实测 qqdl.gtimg.cn 可达（官方 rainbow 页面给的 3.2.18 链接已经 404）。
+LINUXQQ_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_arm64.deb"
+QQ_MIN_BUILD="40768"
+
+# 镜像连通性探测：HEAD 拿状态码，不支持 HEAD 时退回 1 字节 Range 请求。
+# 返回 0 表示 2xx/3xx（可用）；没有 curl 时不拦路，交给 apt/uv 自己判断。
+mirror_alive() {
+  local url="$1" code=""
+  have curl || return 0
+  code=$(curl -s -o /dev/null -w '%{http_code}' -I -L --connect-timeout 5 --max-time 10 "$url" 2>/dev/null || true)
+  case "$code" in 2*|3*) return 0 ;; esac
+  code=$(curl -s -o /dev/null -w '%{http_code}' -L -r 0-0 --connect-timeout 5 --max-time 10 "$url" 2>/dev/null || true)
+  case "$code" in 2*|3*) return 0 ;; esac
+  return 1
+}
 
 # Termux 包源换镜像：直接覆盖 sources.list，兼容新版/旧版格式，避免只 sed 匹配失败。
 write_termux_source() {
@@ -226,8 +277,18 @@ write_termux_source() {
 
 fix_termux_mirror() {
   [ -z "${PREFIX:-}" ] && return 0
-  local m
+  local m usable=""
+  # 先探测，把不可达的源快速跳过（否则每次都要等 apt 超时）
   for m in $TERMUX_MIRRORS; do
+    if mirror_alive "$m/apt/termux-main/dists/stable/Release"; then
+      usable="$usable $m"
+    else
+      warn "Termux 源不可达，已跳过：$m"
+    fi
+  done
+  # 探测全都失败（比如还没装 curl）时不放弃，仍然按原顺序让 apt 自己试
+  [ -n "$usable" ] || usable="$TERMUX_MIRRORS"
+  for m in $usable; do
     write_termux_source "$m"
     info "尝试 Termux 软件源：$m"
     if run_logged apt-get $APT_OPTS update -y; then
@@ -242,7 +303,7 @@ fix_termux_mirror() {
 
 # 容器内 Debian 源换清华镜像
 fix_debian_mirror() {
-  local f=/etc/apt/sources.list code out sf i=0 mirror sec
+  local f=/etc/apt/sources.list code out sf i=0 idx=0 usable="" mirror sec
   # Preserve repository identity from either legacy or deb822 configuration.
   code=$( { grep -hoE '(bookworm|bullseye|trixie|forky)' "$f" /etc/apt/sources.list.d/*.sources 2>/dev/null || true; } | head -1)
   [ -z "$code" ] && code=bookworm
@@ -254,8 +315,23 @@ fix_debian_mirror() {
     mv -f "$sf" "$sf.maibot.disabled" 2>/dev/null || true
   done
 
+  # 先探测（主源 + security 源），不可达的直接跳过，省掉 apt 的长超时；
+  # 万一探测本身不可用，再退回"逐个让 apt 自己试"。
+  local idx=0 usable=""
   for mirror in $DEBIAN_MIRRORS; do
-    i=$((i + 1))
+    idx=$((idx + 1))
+    sec=$(echo "$DEBIAN_SEC_MIRRORS" | cut -d' ' -f"$idx")
+    [ -z "$sec" ] && sec="$mirror"
+    if mirror_alive "$mirror/dists/$code/Release" && mirror_alive "$sec/dists/$code-security/Release"; then
+      usable="$usable $idx"
+    else
+      warn "Debian 源不可达，已跳过：$mirror"
+    fi
+  done
+  [ -n "$usable" ] || { warn "镜像探测都没通过，改为逐个交给 apt 自己判断"; usable=$(seq 1 "$idx"); }
+
+  for i in $usable; do
+    mirror=$(echo "$DEBIAN_MIRRORS" | cut -d' ' -f"$i")
     sec=$(echo "$DEBIAN_SEC_MIRRORS" | cut -d' ' -f"$i")
     [ -z "$sec" ] && sec="$mirror"
     cat > "$f" <<EOF
@@ -623,8 +699,8 @@ NAPCAT_SCREEN="napcat"
 XVFB_SCREEN="napcat-xvfb"
 NAPCAT_LOG="$HOME/napcat.log"
 NAPCAT_ENV="$HOME/.env"
-LINUXQQ_URL="https://dldir1v6.qq.com/qqfile/qq/QQNT/Linux/QQ_3.2.18_250626_arm64_01.deb"
-NAPCAT_FALLBACK_VERSION="v4.18.28"
+# QQ 安装包地址与最低构建号见上方「镜像加速」段（LINUXQQ_URL / QQ_MIN_BUILD）
+NAPCAT_FALLBACK_VERSION="v4.18.42"
 NAPCAT_WS_PORT="3001"
 # QQ 是 Electron：容器里 --no-sandbox 必需。其余开关保持与官方 Termux 配方一致，
 # 需要额外加（如 --disable-gpu）时用环境变量 MAIBOT_QQ_FLAGS 覆盖即可，默认不动。
@@ -919,10 +995,20 @@ update() {
 sync_deps() {
   cd "$BOT_DIR" || return 1
   have uv || { err "找不到 uv：请先执行 install（或点「按顺序安装」）"; return 1; }
-  # 国内网络下单一镜像经常抽风：按 阿里云 → 清华 → 官方PyPI 依次回退。
+  # 国内网络下单一镜像经常抽风：先按实测顺序探测，跳过连不上的，
+  # 可用源里依次回退（阿里云 → 清华 → 腾讯云 → 华为云 → 中科大 → 官方 PyPI）。
   # 每个源内部先试 --frozen（按 uv.lock 精确还原），锁文件过期再退回普通 sync。
-  local url label
-  for url in "$PY_INDEX_URL" "https://pypi.tuna.tsinghua.edu.cn/simple" ""; do
+  local url label list=""
+  for url in $PYPI_MIRRORS; do
+    if mirror_alive "$url/pip/"; then
+      list="$list $url"
+    else
+      warn "PyPI 镜像不可达，已跳过：$url"
+    fi
+  done
+  # 探测全失败时不放弃：仍然把候选源都试一遍，最后再兜底官方 PyPI
+  [ -n "$list" ] || list=" $PYPI_MIRRORS"
+  for url in $list ""; do
     if [ -n "$url" ]; then label="$url"; else label="官方 PyPI"; fi
     info "同步依赖（$label，首次或网络慢时可能要几分钟）..."
     if [ -n "$url" ]; then
@@ -934,7 +1020,7 @@ sync_deps() {
     fi
     warn "用 $label 同步失败，换下一个源重试"
   done
-  err "依赖同步失败：三个源都没成功，基本是网络问题（可换网络后点「修复依赖」重试）"
+  err "依赖同步失败：所有源都没成功，基本是网络问题（可换网络后点「修复依赖」重试）"
   return 1
 }
 
@@ -1265,6 +1351,11 @@ doctor() {
   info "NapCat 注入的启动器：$(grep -c 'napcat\.mjs' /opt/QQ/resources/app/app_launcher/index.js 2>/dev/null | tr -d ' ') 处引用（0=没注入成功，重装 NapCat）"
   info "磁盘：$(df -h /root 2>/dev/null | tail -1)"
   say ""
+  say "--- 镜像连通性（决定依赖/安装包能不能下载）---"
+  mirror_alive "$DEBIAN_MIRROR/dists/bookworm/Release" && ok "Debian 源可用：$DEBIAN_MIRROR" || warn "Debian 源不可达：$DEBIAN_MIRROR"
+  mirror_alive "$PY_INDEX_URL/pip/" && ok "PyPI 源可用：$PY_INDEX_URL" || warn "PyPI 源不可达：$PY_INDEX_URL"
+  info "完整测速：Termux 菜单 27，或 bash ~/maibot-onekey.sh mirrors"
+  say ""
   say "--- 适配器 ---"
   adapter_status
   say ""
@@ -1321,20 +1412,35 @@ napcat_install() {
     || { err "依赖安装失败，可重试（已下载部分会复用）"; return 1; }
 
   step "安装 Linux QQ"
-  if [ -f "/opt/QQ/qq" ] && [ "${MAIBOT_QQ_REINSTALL:-0}" != "1" ]; then
-    ok "Linux QQ 已安装，跳过（QQ 太旧时用菜单 26 重装：NapCat 要求构建号 ≥40768）"
+  # NapCat 要求 QQ 构建号 >= 40768：装得太旧会在启动阶段静默崩，所以旧版自动重装。
+  local qq_build="" need_qq=0
+  if [ ! -f "/opt/QQ/qq" ]; then
+    need_qq=1
+  elif [ "${MAIBOT_QQ_REINSTALL:-0}" = "1" ]; then
+    need_qq=1
+  elif qq_build=$(qq_build_version) && [ "$qq_build" -lt "$QQ_MIN_BUILD" ]; then
+    warn "已安装的 QQ 构建号 $qq_build 低于 NapCat 要求的 $QQ_MIN_BUILD，自动重装"
+    need_qq=1
   else
-    # 腾讯 CDN 在部分手机网络/代理下不可达。先保留官方动态地址，
-    # 再从维护 QQ 官方安装包归档的 GitHub release 动态选 arm64 deb。
+    ok "Linux QQ 已安装（构建号 ${qq_build:-未知}），跳过"
+  fi
+  if [ "$need_qq" = "1" ]; then
+    # 候选顺序（2026-10 实测）：
+    #   1) qqdl.gtimg.cn 的 3.2.34-53644 —— NapCat 官方安装器钉住的版本，实测可达
+    #   2) im.qq.com 动态解析出的地址 —— 官方页面的地址可能已 404（如 3.2.18）
+    #   3) Rodert/qq-versions 归档的最新 arm64 deb（带 SHA-256 校验）
+    #   4) 归档固定包（API 不可达时）
     local official_url release_json asset_url asset_name expected_sum actual_sum
     official_url=$(curl -fsSL --connect-timeout 12 --max-time 25 \
       "https://im.qq.com/rainbow/linuxQQDownload" 2>/dev/null \
       | grep -oE 'https://dldir1[^" ]*arm64_01\.deb' | head -1)
-    [ -n "$official_url" ] || official_url="$LINUXQQ_URL"
-    info "QQ 官方候选：$official_url"
+    info "QQ 首选：$LINUXQQ_URL（NapCat 要求构建号 >= $QQ_MIN_BUILD）"
+    [ -n "$official_url" ] && info "QQ 官方页面候选：$official_url"
 
     release_json=$(curl -fsSL --connect-timeout 12 --max-time 25 \
       "https://api.github.com/repos/Rodert/qq-versions/releases/latest" 2>/dev/null || true)
+    [ -n "$release_json" ] || release_json=$(curl -fsSL --connect-timeout 12 --max-time 25 \
+      "${GITHUB_PROXY}https://api.github.com/repos/Rodert/qq-versions/releases/latest" 2>/dev/null || true)
     # API 不可达时仍保留一份已核验的归档候选及其 SHA-256。
     asset_name=$(printf '%s' "$release_json" | jq -r '.assets[]? | select(.name | test("_arm64_01\\.deb$")) | .name' 2>/dev/null | head -1)
     if [ -n "$asset_name" ]; then
@@ -1346,19 +1452,32 @@ napcat_install() {
       warn "GitHub API 不可用，使用已校验的固定备用包：$asset_name"
     fi
 
-    # 验证下载完整性：下载必须是 deb 包，且归档仓库提供 SHA256SUMS 时校验摘要。
-    if ! dl /tmp/linuxqq.deb "$official_url" "$asset_url" "${GITHUB_PROXY}${asset_url}"; then
-      err "QQ 官方 CDN 与 GitHub 归档都不可达。请检查手机的代理/VPN 是否覆盖 Termux 流量"
-      return 1
+    # 按顺序尝试：首选官方 3.2.34（无公开摘要，靠 deb 格式与构建号校验）
+    # → 官方页面地址 / 归档包 / 归档包走 GitHub 代理（归档包有摘要时校验 SHA-256）
+    local qq_src="preferred"
+    if ! dl /tmp/linuxqq.deb "$LINUXQQ_URL"; then
+      qq_src="archive"
+      warn "首选 QQ 包不可达，改用官方页面地址与 GitHub 归档 ..."
+      if ! dl /tmp/linuxqq.deb "$official_url" "$asset_url" "${GITHUB_PROXY}${asset_url}"; then
+        err "QQ 官方 CDN 与 GitHub 归档都不可达。请检查手机的代理/VPN 是否覆盖 Termux 流量"
+        return 1
+      fi
     fi
     if ! ar t /tmp/linuxqq.deb >/dev/null 2>&1; then
       err "下载结果不是有效的 Debian 安装包（可能是代理错误页），拒绝安装"
       rm -f /tmp/linuxqq.deb
       return 1
     fi
-    if [ -n "$asset_name" ]; then
+    if [ "$qq_src" = "archive" ] && [ -n "$asset_name" ]; then
       expected_sum=$(printf '%s' "$release_json" | jq -r --arg n "$asset_name" '.body // "" | split("\\n")[] | select(test("`" + $n + "`")) | match("[0-9a-f]{64}").string' 2>/dev/null | head -1)
       [ -n "$expected_sum" ] || [ "$asset_name" != "QQ_3.2.32_260812_arm64_01.deb" ] || expected_sum="8796ccfd66acc025ef18db37185532d40bc8c58921e17da6d28c295acbcf8f92"
+      # 只有下载的确实是归档里那个包时才校验摘要，否则会把"官方页面地址"下载的包误判为校验失败
+      expected_size=$(printf '%s' "$release_json" | jq -r --arg n "$asset_name" '.assets[]? | select(.name == $n) | .size' 2>/dev/null | head -1)
+      actual_size=$(stat -c %s /tmp/linuxqq.deb 2>/dev/null || echo 0)
+      if [ -n "$expected_sum" ] && [ -n "$expected_size" ] && [ "$expected_size" != "$actual_size" ]; then
+        info "本次下载来自其它来源（$actual_size 字节 ≠ 归档 $expected_size 字节），跳过归档摘要校验"
+        expected_sum=""
+      fi
       if [ -n "$expected_sum" ]; then
         actual_sum=$(sha256sum /tmp/linuxqq.deb | awk '{print $1}')
         if [ "$expected_sum" != "$actual_sum" ]; then
@@ -1368,7 +1487,7 @@ napcat_install() {
         fi
         ok "QQ 安装包 SHA-256 校验通过"
       else
-        warn "GitHub 归档没有提供该文件摘要，只通过 deb 格式检查"
+        warn "该来源没有提供文件摘要，只通过 deb 格式与构建号检查"
       fi
     fi
     info "安装 Linux QQ 包 ..."
@@ -1404,7 +1523,12 @@ napcat_install() {
     mkdir -p "$NAPCAT_DIR"
     local ver=""
     info "查询 NapCat 最新版本 ..."
-    ver=$(curl -s --connect-timeout 15 "https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest" 2>/dev/null | jq -r '.tag_name // empty')
+    # 国内直连 api.github.com 经常失败，再走一次 GitHub 代理；都失败才用固定版本
+    ver=$(curl -s --connect-timeout 12 --max-time 20 "https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest" 2>/dev/null | jq -r '.tag_name // empty')
+    if [ -z "$ver" ]; then
+      info "直连 GitHub API 失败，改用代理查询 ..."
+      ver=$(curl -s --connect-timeout 12 --max-time 25 "${GITHUB_PROXY}https://api.github.com/repos/NapNeko/NapCatQQ/releases/latest" 2>/dev/null | jq -r '.tag_name // empty')
+    fi
     if [ -z "$ver" ]; then
       warn "无法获取最新版本号，改用已知可用版本：$NAPCAT_FALLBACK_VERSION"
       ver="$NAPCAT_FALLBACK_VERSION"
@@ -2000,9 +2124,9 @@ menu() {
     say "  --- 服务器模式 ---"
     say "  18)启动全部 19)停止全部"
     say "  --- 连接检查 ---"
-    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖 25)清理残留 26)重装QQ"
+    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖 25)清理残留 26)重装QQ 27)镜像测速"
     say "  0)退出"
-    printf '请输入 [0-26]：'
+    printf '请输入 [0-27]：'
     read -r n
     case "$n" in
       1) check;; 2) install;; 3) update;; 4) start;; 5) fg_run;; 6) stop;;
@@ -2011,7 +2135,7 @@ menu() {
       15) napcat_stop;; 16) napcat_status;; 17) napcat_webui;;
       18) allstart;; 19) allstop;;
       20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;; 23) doctor;; 24) fix_deps;;
-      25) reset_sessions;; 26) MAIBOT_QQ_REINSTALL=1 napcat_install;;
+      25) reset_sessions;; 26) MAIBOT_QQ_REINSTALL=1 napcat_install;; 27) mirrors_check;;
       0|q|Q) say "再见"; break;; *) warn "无效输入";;
     esac
   done
@@ -2046,6 +2170,7 @@ case "$RUN_ACTION" in
   doctor)         doctor ;;
   fix-deps)       fix_deps ;;
   reset)          reset_sessions ;;
+  mirrors)        mirrors_check ;;
   adapter-setup)  adapter_setup "${2:-}" ;;
   adapter-status) adapter_status ;;
   menu|"")        menu ;;

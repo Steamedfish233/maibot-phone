@@ -65,6 +65,70 @@
                 </LinearLayout>
             </LinearLayout>
 
+            <!-- 安装优先：下载后第一件事就是安装，所以向导放在最上面（其后是项目反馈） -->
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.6" />
+
+            <TextView
+                android:id="@+id/tv_install_guide"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="① 安装并首次打开 Termux → ② 授权并开启外部命令 → ③ 检查安装条件 → ④ 一键安装 Debian 和 MaiBot → ⑤ 启动后打开 WebUI 配置模型，再装 NapCat 扫码登录 QQ。安装期间可切到后台或锁屏。"
+                android:textColor="@color/body"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/btn_install_guide"
+                style="@style/PrimaryBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="开始首次安装向导" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_diagnose"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="检查安装条件" />
+
+                <Space
+                    android:layout_width="8dp"
+                    android:layout_height="1dp" />
+
+                <Button
+                    android:id="@+id/btn_auto_install"
+                    style="@style/OutlinedBtn"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="按顺序安装" />
+            </LinearLayout>
+
+            <!-- 项目主页 -->
+            <TextView style="@style/SectionHeader" android:text="项目与反馈" />
+
+            <Button
+                android:id="@+id/btn_github"
+                style="@style/OutlinedBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="打开项目 GitHub 主页" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="github.com/Steamedfish233/maibot-phone\n使用问题、建议或 Bug 请在仓库的 Issues 中反馈。本项目不是 MaiBot / NapCat / Termux 官方项目。"
+                android:textColor="@color/subtitle"
+                android:textSize="11sp" />
+
             <!-- 服务状态 -->
             <TextView style="@style/SectionHeader" android:text="服务状态" />
 
@@ -278,51 +342,8 @@
                     android:text="关闭电池优化（建议先做）" />
             </LinearLayout>
 
-            <!-- 安装向导 -->
-            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.4" />
-
-            <TextView
-                android:id="@+id/tv_install_guide"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="① 安装并首次打开 Termux → ② 授权并开启外部命令 → ③ 检查安装条件 → ④ 安装 Debian 和 MaiBot → ⑤ 确认协议、配置模型与 QQ。安装期间可切到后台或锁屏。"
-                android:textColor="@color/body"
-                android:textSize="14sp" />
-
-            <Button
-                android:id="@+id/btn_install_guide"
-                style="@style/PrimaryBtn"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:text="开始首次安装向导" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/btn_diagnose"
-                    style="@style/OutlinedBtn"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="检查安装条件" />
-
-                <Space
-                    android:layout_width="8dp"
-                    android:layout_height="1dp" />
-
-                <Button
-                    android:id="@+id/btn_auto_install"
-                    style="@style/OutlinedBtn"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:text="按顺序安装" />
-            </LinearLayout>
+            <!-- 安装步骤详解：向导（顶部）会按顺序调用这些动作，这里保留手动入口 -->
+            <TextView style="@style/SectionHeader" android:text="安装步骤详解（第 0-3 步）" />
 
             <!-- 第 0 步 -->
             <TextView style="@style/SectionHeader" android:text="第 0 步：安装 Termux" />
@@ -480,23 +501,6 @@
                 android:layout_marginTop="8dp"
                 android:text="修复依赖（MaiBot 卡在 Building 时用）" />
 
-            <!-- 项目主页 -->
-            <TextView style="@style/SectionHeader" android:text="项目与反馈" />
-
-            <Button
-                android:id="@+id/btn_github"
-                style="@style/OutlinedBtn"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="打开项目 GitHub 主页" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:text="github.com/Steamedfish233/maibot-phone\n使用问题、建议或 Bug 请在仓库的 Issues 中反馈。本项目不是 MaiBot / NapCat / Termux 官方项目。"
-                android:textColor="@color/subtitle"
-                android:textSize="11sp" />
         </LinearLayout>
     </ScrollView>
 

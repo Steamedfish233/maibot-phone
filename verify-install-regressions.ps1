@@ -21,6 +21,10 @@ trap 'rm -rf "$work"' EXIT
 BOT_DIR="$work/bot"; LOG_FILE="$work/mai.log"; SCREEN_NAME=maibot
 NAPCAT_DIR="$work/napcat"; NAPCAT_ENV="$work/account"; NAPCAT_SCREEN=napcat; NAPCAT_LOG="$work/napcat.log"
 NAPCAT_WS_PORT=3001; XVFB_SCREEN=napcat-xvfb; XVFB_LOG="$work/xvfb.log"; QQ_LAUNCH_FLAGS="--no-sandbox"
+PYPI_MIRRORS="https://mirrors.aliyun.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple"
+QQ_MIN_BUILD=40768; LINUXQQ_URL="https://example.invalid/linuxqq.deb"
+# mirror probing must not block the tests: pretend the first mirror is reachable
+mirror_alive(){ return 0; }
 mkdir -p "$BOT_DIR/.git" "$BOT_DIR/data" "$NAPCAT_DIR"
 # uv / run_logged are only used for dependency sync; make sync "succeed" so the
 # tests reach the launch-failure branches below.

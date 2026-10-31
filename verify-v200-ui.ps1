@@ -71,6 +71,22 @@ if ($xmlText -match 'textIsSelectable') { Fail 'textIsSelectable not allowed in 
 if ($xmlText -notmatch 'Steamedfish233/maibot-phone') { Fail 'layout must show the project repository' }
 Pass 'author QQ replaced by the project repository link'
 
+# The screen is ordered install-first: a fresh install is the very first task, so the
+# first-run wizard (and the project/feedback link) must sit above the daily-use blocks.
+# ASCII-only markers on purpose: this file is read as ANSI by Windows PowerShell.
+$posGuide = $xmlText.IndexOf('@+id/btn_install_guide')
+$posGithub = $xmlText.IndexOf('@+id/btn_github')
+$posStatus = $xmlText.IndexOf('@+id/tv_maibot')
+$posWebui = $xmlText.IndexOf('@+id/btn_webui')
+if ($posGuide -lt 0 -or $posGithub -lt 0 -or $posStatus -lt 0 -or $posWebui -lt 0) {
+    Fail 'install guide / project link / status / webui controls are missing'
+}
+if ($posGuide -gt $posStatus) { Fail 'first-run wizard must come before the status section' }
+if ($posGithub -gt $posWebui) { Fail 'project + feedback link must come before the WebUI section' }
+if ($xmlText -notmatch 'v2\.0\.6"') { Fail 'install wizard header does not show the current version' }
+if ($xmlText -match 'v2\.0\.5"') { Fail 'install wizard header still shows the previous version' }
+Pass 'first-run wizard and project feedback are placed first'
+
 # 3. MainActivity behaviour
 $main = Read-Text $mainPath
 foreach ($needle in @(
@@ -112,9 +128,9 @@ Pass 'installer script verifies WebUI over HTTP and configures the official adap
 
 # 5. version
 $gradle = Read-Text $gradlePath
-if (!$gradle.Contains('versionName = "2.0.5"')) { Fail 'versionName is not 2.0.5' }
-if (!$gradle.Contains('versionCode = 33')) { Fail 'versionCode is not 33' }
-Pass 'version 2.0.5 (33)'
+if (!$gradle.Contains('versionName = "2.0.6"')) { Fail 'versionName is not 2.0.6' }
+if (!$gradle.Contains('versionCode = 34')) { Fail 'versionCode is not 34' }
+Pass 'version 2.0.6 (34)'
 
 # 6. APK metadata when built
 $apk = Join-Path $root 'MaibotApp/app/build/outputs/apk/release/app-release.apk'
@@ -122,8 +138,8 @@ if (Test-Path -LiteralPath $apk) {
     $aapt2 = Join-Path $root 'android-sdk/build-tools/34.0.0/aapt2.exe'
     if (Test-Path -LiteralPath $aapt2) {
         $badging = & $aapt2 dump badging $apk 2>$null | Select-Object -First 1
-        if ($badging -notmatch "versionName='2.0.5'") { Fail "APK versionName mismatch: $badging" }
-        if ($badging -notmatch "versionCode='33'") { Fail "APK versionCode mismatch: $badging" }
+        if ($badging -notmatch "versionName='2.0.6'") { Fail "APK versionName mismatch: $badging" }
+        if ($badging -notmatch "versionCode='34'") { Fail "APK versionCode mismatch: $badging" }
         Pass 'APK version metadata'
     }
 }
