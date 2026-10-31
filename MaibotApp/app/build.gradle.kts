@@ -13,8 +13,8 @@ android {
         applicationId = "com.maibot.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 31
-        versionName = "2.0.3"
+        versionCode = 32
+        versionName = "2.0.4"
     }
 
     // The repo ships no keystore and no passwords: *.jks and keystore.properties are gitignored.

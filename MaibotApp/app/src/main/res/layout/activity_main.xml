@@ -279,7 +279,7 @@
             </LinearLayout>
 
             <!-- 安装向导 -->
-            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.3" />
+            <TextView style="@style/SectionHeader" android:text="首次安装向导 · v2.0.4" />
 
             <TextView
                 android:id="@+id/tv_install_guide"

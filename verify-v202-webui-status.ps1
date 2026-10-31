@@ -14,8 +14,12 @@ if ($text -notmatch '(?s)sync_deps\(\)\s*\{.*?uv sync --frozen.*?uv sync\b') {
 }
 if ($text -notmatch 'fix-deps\)\s+fix_deps') { throw 'fix-deps action must be routed' }
 if ($text -notmatch 'qq_process_running\(\)') { throw 'NapCat must detect the real QQ process' }
+if ($text -notmatch 'pypi\.tuna\.tsinghua\.edu\.cn') { throw 'dependency sync needs a mirror fallback chain' }
+if ($text -notmatch "'Dead'") { throw 'doctor must spot dead screen sessions' }
+if ($text -notmatch 'uv\.lock" -nt') { throw 'doctor must compare uv.lock against .venv' }
 Write-Host 'PASS: start syncs deps first and launches with --no-sync'
 Write-Host 'PASS: fix-deps action routed; QQ process detection present'
+Write-Host 'PASS: doctor reports dead sessions and unsynced dependencies'
 
 # ASCII-only on purpose: Windows PowerShell reads .ps1 as ANSI when there is no BOM,
 # so non-ASCII text in this file would break parsing.

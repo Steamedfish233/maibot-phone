@@ -887,17 +887,22 @@ update() {
 sync_deps() {
   cd "$BOT_DIR" || return 1
   have uv || { err "找不到 uv：请先执行 install（或点「按顺序安装」）"; return 1; }
-  info "同步依赖（uv sync，首次或网络慢时可能要几分钟）..."
-  if run_logged env UV_INDEX_URL="$PY_INDEX_URL" uv sync --frozen; then
-    ok "依赖已同步（按 uv.lock 锁定版本）"
-    return 0
-  fi
-  warn "uv sync --frozen 失败（锁文件可能过期），改用 uv sync 重试"
-  if run_logged env UV_INDEX_URL="$PY_INDEX_URL" uv sync; then
-    ok "依赖已同步"
-    return 0
-  fi
-  err "依赖同步失败：看上面的输出（多为网络/镜像问题，可重试或换网络）"
+  # 国内网络下单一镜像经常抽风：按 阿里云 → 清华 → 官方PyPI 依次回退。
+  # 每个源内部先试 --frozen（按 uv.lock 精确还原），锁文件过期再退回普通 sync。
+  local url label
+  for url in "$PY_INDEX_URL" "https://pypi.tuna.tsinghua.edu.cn/simple" ""; do
+    if [ -n "$url" ]; then label="$url"; else label="官方 PyPI"; fi
+    info "同步依赖（$label，首次或网络慢时可能要几分钟）..."
+    if [ -n "$url" ]; then
+      run_logged env UV_INDEX_URL="$url" uv sync --frozen && { ok "依赖已同步"; return 0; }
+      run_logged env UV_INDEX_URL="$url" uv sync && { ok "依赖已同步"; return 0; }
+    else
+      run_logged uv sync --frozen && { ok "依赖已同步"; return 0; }
+      run_logged uv sync && { ok "依赖已同步"; return 0; }
+    fi
+    warn "用 $label 同步失败，换下一个源重试"
+  done
+  err "依赖同步失败：三个源都没成功，基本是网络问题（可换网络后点「修复依赖」重试）"
   return 1
 }
 
@@ -1119,6 +1124,25 @@ doctor() {
   info "WS 端口 $NAPCAT_WS_PORT：$(napcat_port_open "$NAPCAT_WS_PORT" && echo 已监听 || echo 未监听)"
   info "日志：${NAPCAT_LOG}"
   webui_log_tail "$NAPCAT_LOG" 12
+  say ""
+  say "--- 为什么会变成这样 ---"
+  # Dead 会话 = 进程早就退了，只剩空壳；这正是"以前能用、现在不动"的典型现场
+  local dead=0
+  screen -ls 2>/dev/null | grep -q 'Dead' && dead=1
+  screen -ls 2>/dev/null | while IFS= read -r l; do info "$l"; done
+  [ "$dead" = 1 ] && warn "有 Dead 会话：进程早已退出，只剩空壳（旧版本会把它当成'运行中'）"
+  if [ -x "$BOT_DIR/.venv/bin/python" ]; then
+    info "venv Python：$("$BOT_DIR/.venv/bin/python" -V 2>&1)"
+  else
+    warn "venv Python：缺失（依赖没装好，点「修复依赖」重建）"
+  fi
+  if [ -f "$BOT_DIR/uv.lock" ] && [ -d "$BOT_DIR/.venv" ] && [ "$BOT_DIR/uv.lock" -nt "$BOT_DIR/.venv" ]; then
+    warn "uv.lock 比 .venv 新：依赖很可能没同步完 → 点「修复依赖」"
+  fi
+  [ -f "$BOT_DIR/.git/FETCH_HEAD" ] && info "最近一次更新代码：$(date -r "$BOT_DIR/.git/FETCH_HEAD" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 未知)"
+  info "NapCat 目录：$([ -d "$NAPCAT_DIR" ] && echo 存在 || echo 缺失)"
+  info "QQ 程序 /opt/QQ/qq：$([ -x /opt/QQ/qq ] && echo 存在 || echo 缺失)"
+  info "磁盘：$(df -h /root 2>/dev/null | tail -1)"
   say ""
   say "--- 适配器 ---"
   adapter_status

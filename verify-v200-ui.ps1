@@ -112,9 +112,9 @@ Pass 'installer script verifies WebUI over HTTP and configures the official adap
 
 # 5. version
 $gradle = Read-Text $gradlePath
-if (!$gradle.Contains('versionName = "2.0.3"')) { Fail 'versionName is not 2.0.3' }
-if (!$gradle.Contains('versionCode = 31')) { Fail 'versionCode is not 31' }
-Pass 'version 2.0.3 (31)'
+if (!$gradle.Contains('versionName = "2.0.4"')) { Fail 'versionName is not 2.0.4' }
+if (!$gradle.Contains('versionCode = 32')) { Fail 'versionCode is not 32' }
+Pass 'version 2.0.4 (32)'
 
 # 6. APK metadata when built
 $apk = Join-Path $root 'MaibotApp/app/build/outputs/apk/release/app-release.apk'
@@ -122,8 +122,8 @@ if (Test-Path -LiteralPath $apk) {
     $aapt2 = Join-Path $root 'android-sdk/build-tools/34.0.0/aapt2.exe'
     if (Test-Path -LiteralPath $aapt2) {
         $badging = & $aapt2 dump badging $apk 2>$null | Select-Object -First 1
-        if ($badging -notmatch "versionName='2.0.3'") { Fail "APK versionName mismatch: $badging" }
-        if ($badging -notmatch "versionCode='31'") { Fail "APK versionCode mismatch: $badging" }
+        if ($badging -notmatch "versionName='2.0.4'") { Fail "APK versionName mismatch: $badging" }
+        if ($badging -notmatch "versionCode='32'") { Fail "APK versionCode mismatch: $badging" }
         Pass 'APK version metadata'
     }
 }
