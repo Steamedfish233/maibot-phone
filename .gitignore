@@ -29,6 +29,9 @@ test-funcs.sh
 debug-*.sh
 fake-webui.js
 
+# 本机一次性工具（例如清理 Steam++ 写入 hosts 的条目），与 App 无关
+fix-steampp-hosts.ps1
+
 # 旧的源码包（保留 dist/ 下的 APK）
 *.zip
 
