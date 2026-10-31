@@ -10,7 +10,8 @@ err(){ :; }; warn(){ :; }; info(){ :; }; ok(){ :; }; say(){ :; }
 foreach ($name in @('update','sync_deps','webui_log_tail','start','prepare_bot','logs','sync_napcat_config',
                     'maibot_port_open','napcat_port_open','screen_session_state','screen_session_running',
                     'screen_wipe_dead','screen_drop','maibot_process_running','stop_maibot',
-                    'qq_process_running','xvfb_running','ensure_xvfb','napcat_own_log_tail','napcat_webui_port','napcat_start')) {
+                    'qq_process_running','xvfb_running','ensure_xvfb','patch_qq_main','napcat_inject',
+                    'napcat_own_log_tail','napcat_webui_port','napcat_start')) {
     $match = [regex]::Match($text, '(?ms)^' + $name + '\(\) \{.*?^\}')
     if (!$match.Success) { throw "Function not found: $name" }
     $test += "`n" + $match.Value + "`n"
@@ -21,6 +22,7 @@ trap 'rm -rf "$work"' EXIT
 BOT_DIR="$work/bot"; LOG_FILE="$work/mai.log"; SCREEN_NAME=maibot
 NAPCAT_DIR="$work/napcat"; NAPCAT_ENV="$work/account"; NAPCAT_SCREEN=napcat; NAPCAT_LOG="$work/napcat.log"
 NAPCAT_WS_PORT=3001; XVFB_SCREEN=napcat-xvfb; XVFB_LOG="$work/xvfb.log"; QQ_LAUNCH_FLAGS="--no-sandbox"
+QQ_BIN="$work/qq"; QQ_APP_DIR="$work/qq-app"; QQ_LAUNCHER_DIR="$QQ_APP_DIR/app_launcher"; QQ_NAPCAT_DIR="$QQ_LAUNCHER_DIR/napcat"
 PYPI_MIRRORS="https://mirrors.aliyun.com/pypi/simple https://pypi.tuna.tsinghua.edu.cn/simple"
 QQ_MIN_BUILD=40768; LINUXQQ_URL="https://example.invalid/linuxqq.deb"
 # mirror probing must not block the tests: pretend the first mirror is reachable
@@ -58,6 +60,20 @@ napcat_running(){ return 1; }
 # which would hide the launch-failure path.
 napcat_port_open(){ return 1; }
 napcat_webui_port(){ return 1; }
+# A fake QQ tree, so the injector and the start pre-flight run for real.
+QQ_APP_DIR="$work/qq/resources/app"
+QQ_BIN="$work/qq/qq"
+QQ_LAUNCHER_DIR="$QQ_APP_DIR/app_launcher"
+QQ_NAPCAT_DIR="$QQ_LAUNCHER_DIR/napcat"
+mkdir -p "$QQ_LAUNCHER_DIR"
+printf '{"name":"qq","version":"3.2.34-53644","main":"./app_launcher/index.js"}\n' > "$QQ_APP_DIR/package.json"
+: > "$QQ_LAUNCHER_DIR/index.js"
+napcat_inject >"$work/inject.out" 2>&1 || { echo 'FAIL: napcat_inject failed'; cat "$work/inject.out"; exit 1; }
+[ -f "$QQ_APP_DIR/loadNapCat.js" ] || { echo 'FAIL: loadNapCat.js was not written'; exit 1; }
+[ -f "$QQ_NAPCAT_DIR/napcat.mjs" ] || { echo 'FAIL: napcat.mjs was not copied into QQ'; exit 1; }
+grep -qE '"main"[[:space:]]*:[[:space:]]*"\./loadNapCat\.js"' "$QQ_APP_DIR/package.json" \
+  || { echo 'FAIL: QQ package.json main was not patched'; cat "$QQ_APP_DIR/package.json"; exit 1; }
+echo 'PASS: NapCat is injected the official way (loadNapCat.js + package.json main)'
 napcat_start && { echo 'FAIL: NapCat launch failure swallowed'; exit 1; }
 echo 'PASS: NapCat launch failure propagates'
 # The generated launcher must be valid bash and must keep the real QQ exit code.

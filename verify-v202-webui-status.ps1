@@ -64,6 +64,10 @@ SCREEN_NAME=maibot
 NAPCAT_SCREEN=napcat
 XVFB_SCREEN=napcat-xvfb
 NAPCAT_WS_PORT=3001
+QQ_BIN=/opt/QQ/qq
+QQ_APP_DIR=/opt/QQ/resources/app
+QQ_LAUNCHER_DIR=$QQ_APP_DIR/app_launcher
+QQ_NAPCAT_DIR=$QQ_LAUNCHER_DIR/napcat
 '@
 
 # Extract the real functions in dependency order: tests run the shipped code,

@@ -679,12 +679,12 @@ EOF
     chmod +x "$f" 2>/dev/null || true
   }
 
-  # 启动一个服务并等端口就绪；$2 可传额外环境变量
+  # 启动一个服务并等端口就绪；$2 可传额外环境变量，$3 可覆盖等待秒数
   termux_service_start() {
-    local svc="$1" extra="${2:-}" name action log waited=0 seen=0
+    local svc="$1" extra="${2:-}" timeout="${3:-180}" name action log waited=0 seen=0
     case "$svc" in
-      bot)    name="$TERMUX_BOT_SCREEN";    action="start";        log="$HOME/maibot-bot.log" ;;
-      napcat) name="$TERMUX_NAPCAT_SCREEN"; action="napcat-start"; log="$HOME/maibot-napcat.log" ;;
+      bot)    name="$TERMUX_BOT_SCREEN";    action="start";        log="$HOME/maibot-bot-run.log" ;;
+      napcat) name="$TERMUX_NAPCAT_SCREEN"; action="napcat-start"; log="$HOME/maibot-napcat-run.log" ;;
       *) err "未知服务：$svc"; return 1 ;;
     esac
     if termux_service_up "$svc"; then
@@ -705,11 +705,11 @@ EOF
     : > "$log" 2>/dev/null || true
     screen -dmS "$name" bash -c "bash '$HOME/.maibot-serve-$name.sh' 2>&1 | tee -a '$log'"
     if [ "$svc" = "bot" ]; then
-      info "等待 MaiBot WebUI（8001），最多 180 秒 ..."
+      info "等待 MaiBot WebUI（8001），最多 ${timeout} 秒 ..."
     else
-      info "等待 NapCat WebUI（6099 / WS 3001），最多 180 秒 ..."
+      info "等待 NapCat WebUI（6099 / WS 3001），最多 ${timeout} 秒 ..."
     fi
-    while [ "$waited" -lt 180 ]; do
+    while [ "$waited" -lt "$timeout" ]; do
       sleep 1
       waited=$((waited + 1))
       termux_service_up "$svc" && break
@@ -724,8 +724,16 @@ EOF
       ok "$(termux_service_label "$svc") 已启动"
       return 0
     fi
-    err "$(termux_service_label "$svc") 没能就绪，日志末尾（$log）："
+    err "$(termux_service_label "$svc") 没能就绪，运行日志末尾（$log）："
     termux_log_tail "$log" 20
+    # NapCat 失败时再进容器取一次现场证据（日志开头、注入状态、NapCat 自己的日志）
+    if [ "$svc" = "napcat" ] && have proot-distro; then
+      info "继续在容器内取证（约 3 秒）..."
+      proot-distro login debian --bind "$HOME:/termux-home" \
+        -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+             MAIBOT_NESTED=1 MAIBOT_QUERY=1 \
+        bash /termux-home/maibot-onekey.sh napcat-diag
+    fi
     return 1
   }
 
@@ -772,19 +780,29 @@ EOF
     termux_service_start bot
   }
 
-  # NapCat：Worker 在 proot 里 fork 失败时会静默卡住，失败自动用单进程模式重试一次
+  # NapCat：QQ 能起来但 NapCat 不加载时，逐级换启动方式再试，
+  # 每种方式等待时间递减（正常情况 NapCat 十几秒就能开 6099）。
   termux_start_napcat() {
     termux_wake_lock
     if termux_service_up napcat; then
       ok "NapCat 已在运行"
       return 0
     fi
-    if termux_service_start napcat; then
+    if termux_service_start napcat "" 150; then
       return 0
     fi
-    warn "第一次没起来，改用「单进程模式」重试一次（跳过 utilityProcess.fork）"
+    warn "第一次没起来，改用「单进程模式」重试（跳过 utilityProcess.fork）"
     termux_service_stop napcat quiet
-    termux_service_start napcat "NAPCAT_DISABLE_MULTI_PROCESS=1"
+    if termux_service_start napcat "NAPCAT_DISABLE_MULTI_PROCESS=1" 120; then
+      return 0
+    fi
+    warn "单进程模式也不行，改用「强制 Node 进程」重试（NAPCAT_FORCE_NODE_PROCESS=1）"
+    termux_service_stop napcat quiet
+    if termux_service_start napcat "NAPCAT_DISABLE_MULTI_PROCESS=1 NAPCAT_FORCE_NODE_PROCESS=1" 120; then
+      return 0
+    fi
+    err "NapCat 三种启动方式都没能打开 6099/3001：把上面的现场诊断发给作者"
+    return 1
   }
 
   termux_services_start_all() {
@@ -940,6 +958,13 @@ PY_INDEX_URL="${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 SCREEN_NAME="maibot"
 LOG_FILE="$BOT_DIR/logs/mai.log"
 
+# ---------- QQ 安装位置 ----------
+# 可用环境变量覆盖：回归测试会在临时目录里搭一棵假 QQ 树来验证注入逻辑。
+QQ_BIN="${QQ_BIN:-/opt/QQ/qq}"
+QQ_APP_DIR="${QQ_APP_DIR:-/opt/QQ/resources/app}"
+QQ_LAUNCHER_DIR="$QQ_APP_DIR/app_launcher"
+QQ_NAPCAT_DIR="$QQ_LAUNCHER_DIR/napcat"
+
 # ---------- NapCat 配置 ----------
 NAPCAT_DIR="$HOME/NapCat.linux.arm64"
 NAPCAT_SCREEN="napcat"
@@ -1022,14 +1047,14 @@ napcat_webui_port() {
 }
 napcat_log_url() {
   local f
-  for f in "$NAPCAT_LOG" "$NAPCAT_DIR/napcat.log" "/opt/QQ/resources/app/app_launcher/napcat.log"; do
+  for f in "$NAPCAT_LOG" "$NAPCAT_DIR/napcat.log" "$QQ_APP_DIR/app_launcher/napcat.log"; do
     [ -f "$f" ] || continue
     grep -Eo 'https?://(127\.0\.0\.1|localhost):[0-9]+/webui([^[:space:]]*)?' "$f" | tail -1 && return 0
   done
   return 1
 }
 sync_napcat_config() {
-  local target="/opt/QQ/resources/app/app_launcher/napcat/config"
+  local target="$QQ_APP_DIR/app_launcher/napcat/config"
   [ -d "$target" ] || return 0
   mkdir -p "$target"
   cp -f "$NAPCAT_DIR/config"/onebot11_*.json "$target/" 2>/dev/null || true
@@ -1536,8 +1561,8 @@ doctor() {
   info "内存（MB）：$(free -m 2>/dev/null | sed -n '2p' | tr -s ' ' || echo 未知)"
   say "  -- QQ 现场证据（preload 之后静默退出时看这里）--"
   local qqver qqbuild
-  if [ -f /opt/QQ/resources/app/package.json ] && have jq; then
-    qqver=$(jq -r '.version // empty' /opt/QQ/resources/app/package.json 2>/dev/null)
+  if [ -f $QQ_APP_DIR/package.json ] && have jq; then
+    qqver=$(jq -r '.version // empty' $QQ_APP_DIR/package.json 2>/dev/null)
     info "QQ 版本：${qqver:-未知}"
   fi
   if qqbuild=$(qq_build_version); then
@@ -1550,7 +1575,7 @@ doctor() {
   info "X 锁残留：$([ -e /tmp/.X1-lock ] && echo 有（会挡住 Xvfb 启动，已自动清理）|| echo 无)｜/tmp/.X11-unix：$(ls /tmp/.X11-unix 2>/dev/null | tr '\n' ' ' || echo 无)"
   [ -f "$XVFB_LOG" ] && { info "Xvfb 日志末尾："; webui_log_tail "$XVFB_LOG" 5; }
   local missing=""
-  for f in /opt/QQ/qq /opt/QQ/resources/app/wrapper.node; do
+  for f in $QQ_BIN $QQ_APP_DIR/wrapper.node; do
     [ -f "$f" ] || continue
     missing="$missing$(ldd "$f" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ')"
   done
@@ -1574,8 +1599,8 @@ doctor() {
   fi
   [ -f "$BOT_DIR/.git/FETCH_HEAD" ] && info "最近一次更新代码：$(date -r "$BOT_DIR/.git/FETCH_HEAD" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 未知)"
   info "NapCat 目录：$([ -d "$NAPCAT_DIR" ] && echo 存在 || echo 缺失)"
-  info "QQ 程序 /opt/QQ/qq：$([ -x /opt/QQ/qq ] && echo 存在 || echo 缺失)"
-  info "NapCat 注入的启动器：$(grep -c 'napcat\.mjs' /opt/QQ/resources/app/app_launcher/index.js 2>/dev/null | tr -d ' ') 处引用（0=没注入成功，重装 NapCat）"
+  info "QQ 程序 $QQ_BIN：$([ -x $QQ_BIN ] && echo 存在 || echo 缺失)"
+  info "NapCat 注入：$(have jq && jq -r '.main // "未知"' $QQ_APP_DIR/package.json 2>/dev/null || echo 无法读取)｜loader $([ -f $QQ_APP_DIR/loadNapCat.js ] && echo 有 || echo 无)｜napcat.mjs $([ -f $QQ_APP_DIR/app_launcher/napcat/napcat.mjs ] && echo 有 || echo 无)"
   info "磁盘：$(df -h /root 2>/dev/null | tail -1)"
   say ""
   say "--- 镜像连通性（决定依赖/安装包能不能下载）---"
@@ -1620,7 +1645,7 @@ napcat_check() {
   say ""
   say "${BOLD}===== NapCat 检查 =====${NC}"
   [ -d "$NAPCAT_DIR" ] && ok "NapCat 目录" || warn "NapCat 未装（napcat-install）"
-  [ -f "/opt/QQ/qq" ] && ok "Linux QQ" || warn "Linux QQ 未装"
+  [ -f "$QQ_BIN" ] && ok "Linux QQ" || warn "Linux QQ 未装"
   [ -f "$NAPCAT_ENV" ] && ok "QQ 号：$(grep ACCOUNT "$NAPCAT_ENV" | cut -d= -f2)" || warn "未配置 QQ 号（napcat-setup）"
   napcat_running && ok "NapCat 运行中" || warn "NapCat 未运行"
 }
@@ -1641,7 +1666,7 @@ napcat_install() {
   step "安装 Linux QQ"
   # NapCat 要求 QQ 构建号 >= 40768：装得太旧会在启动阶段静默崩，所以旧版自动重装。
   local qq_build="" need_qq=0
-  if [ ! -f "/opt/QQ/qq" ]; then
+  if [ ! -f "$QQ_BIN" ]; then
     need_qq=1
   elif [ "${MAIBOT_QQ_REINSTALL:-0}" = "1" ]; then
     need_qq=1
@@ -1728,14 +1753,14 @@ napcat_install() {
       warn "apt 安装本地包失败，改用 dpkg 并立刻补齐依赖 ..."
       run_logged dpkg -i --force-depends /tmp/linuxqq.deb || true
       run_logged apt-get $APT_OPTS install -y -f || warn "补依赖失败，可稍后重试"
-      [ -f "/opt/QQ/qq" ] || { err "Linux QQ 安装失败"; return 1; }
+      [ -f "$QQ_BIN" ] || { err "Linux QQ 安装失败"; return 1; }
       ok "Linux QQ 安装完成（已尝试补齐依赖）"
     fi
     rm -f /tmp/linuxqq.deb
     # dpkg -i --force-depends 会跳过依赖：缺库时 QQ 会在启动阶段静默崩掉，
     # 所以这里立刻检查一次，把问题在安装阶段就暴露出来。
     local misslib=""
-    for f in /opt/QQ/qq /opt/QQ/resources/app/wrapper.node; do
+    for f in $QQ_BIN $QQ_APP_DIR/wrapper.node; do
       [ -f "$f" ] || continue
       misslib="$misslib$(ldd "$f" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ')"
     done
@@ -1793,18 +1818,139 @@ napcat_install() {
   fi
 
   step "注入 NapCat 到 QQ 启动器"
-  local launcher="/opt/QQ/resources/app/app_launcher"
-  if [ -d "$launcher" ]; then
-    echo "(async () => {await import('file://$NAPCAT_DIR/napcat.mjs');})();" > "$launcher/index.js"
-    ok "NapCat 已注入"
-  else
-    err "未找到 $launcher，注入失败（QQ 可能未正确安装）"
-    return 1
-  fi
+  napcat_inject || return 1
 
   say ""
   ok "NapCat 安装完成"
   info "下一步：bash $0 napcat-setup <QQ号>"
+  return 0
+}
+
+# 修改 QQ 的 resources/app/package.json，把 main 指到 loader；返回原 main
+patch_qq_main() {
+  local pkg="$1" loader="$2" cur=""
+  [ -f "$pkg" ] || return 1
+  cp -f "$pkg" "$pkg.maibot.bak" 2>/dev/null || true
+  if have jq; then
+    cur=$(jq -r '.main // empty' "$pkg" 2>/dev/null || true)
+    if jq --arg m "$loader" '.main = $m' "$pkg" > "$pkg.tmp" 2>/dev/null && [ -s "$pkg.tmp" ]; then
+      mv -f "$pkg.tmp" "$pkg"
+      printf '%s' "$cur"
+      return 0
+    fi
+    rm -f "$pkg.tmp" 2>/dev/null || true
+  fi
+  # 没有 jq（或 jq 失败）时用 sed 兜底，保证注入不会因为工具缺失而失败
+  if grep -q '"main"[[:space:]]*:' "$pkg" 2>/dev/null; then
+    sed -i "s|\"main\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"main\": \"$loader\"|" "$pkg" 2>/dev/null \
+      || sed "s|\"main\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"main\": \"$loader\"|" "$pkg" > "$pkg.tmp" 2>/dev/null && mv -f "$pkg.tmp" "$pkg" 2>/dev/null
+    grep -q "\"main\"[[:space:]]*:[[:space:]]*\"$loader\"" "$pkg" 2>/dev/null || return 1
+    printf '%s' "$cur"
+    return 0
+  fi
+  return 1
+}
+
+# 把 NapCat 注入 QQ —— 按 NapCat 官方安装器（NapCat-Installer）的做法：
+#   1) NapCat 的文件放到 resources/app/app_launcher/napcat/
+#   2) resources/app/ 下写 loadNapCat.js（加载 app_launcher/napcat/napcat.mjs）
+#   3) 把 QQ 的 resources/app/package.json 的 main 指到 ./loadNapCat.js
+# 旧做法是直接覆盖 app_launcher/index.js —— 对现在的 LinuxQQ 无效：QQ 不再从
+# 那个文件启动，于是 QQ 自己正常跑起来、NapCat 一行 JS 都不执行，
+# 表现就是"日志停在 Electron IPC 初始化之后、没有 banner、没有 6099 端口"。
+napcat_inject() {
+  local app_dir="$QQ_APP_DIR"
+  local launcher_dir="$app_dir/app_launcher"
+  local target="$launcher_dir/napcat"
+  say ""
+  say "${BOLD}===== 注入 NapCat 到 QQ =====${NC}"
+  [ -d "$launcher_dir" ] || { err "未找到 $launcher_dir（QQ 没装好？）"; return 1; }
+  [ -f "$NAPCAT_DIR/napcat.mjs" ] || { err "NapCat 文件不完整（缺 $NAPCAT_DIR/napcat.mjs），先点「安装 NapCat」"; return 1; }
+
+  mkdir -p "$target"
+  # config / plugins 已存在时不要覆盖：里面是登录状态和用户配置
+  local item base
+  for item in "$NAPCAT_DIR"/*; do
+    [ -e "$item" ] || continue
+    base=$(basename "$item")
+    case "$base" in
+      config|plugins)
+        mkdir -p "$target/$base"
+        cp -rn "$item/." "$target/$base/" 2>/dev/null || true
+        ;;
+      *)
+        cp -rf "$item" "$target/" 2>/dev/null || true
+        ;;
+    esac
+  done
+  [ -f "$target/napcat.mjs" ] || { err "NapCat 文件复制失败：$target/napcat.mjs 不存在"; return 1; }
+
+  cat > "$app_dir/loadNapCat.js" <<'LOADER_EOF'
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+import(pathToFileURL(path.join(__dirname, 'app_launcher/napcat/napcat.mjs')).href);
+LOADER_EOF
+  # 官方不同版本里 loader 有 .js / .cjs 两种写法，两个都放，避免版本对不上
+  cp -f "$app_dir/loadNapCat.js" "$app_dir/loadNapCat.cjs" 2>/dev/null || true
+
+  local pkg="$app_dir/package.json" oldmain=""
+  if oldmain=$(patch_qq_main "$pkg" "./loadNapCat.js"); then
+    ok "QQ 启动入口已指向 loadNapCat.js（原入口：${oldmain:-未知}）"
+  else
+    warn "改不动 $pkg 的 main，退回旧做法（覆盖 app_launcher/index.js）"
+    echo "(async () => {await import('file://$target/napcat.mjs');})();" > "$launcher_dir/index.js"
+  fi
+
+  # 与官方安装器一致：同步 ~/.config/QQ/versions/config.json。
+  # QQ 升级后如果这份配置还指向旧版本目录，我们打的补丁就不会被加载。
+  local qqver="" buildid="" vcfg="$HOME/.config/QQ/versions/config.json"
+  have jq && qqver=$(jq -r '.version // empty' "$pkg" 2>/dev/null || true)
+  buildid="${qqver##*-}"
+  if [ -f "$vcfg" ] && [ -n "$qqver" ] && have jq; then
+    if jq --arg v "$qqver" --arg b "$buildid" '.baseVersion=$v | .curVersion=$v | .buildId=$b' "$vcfg" > "$vcfg.tmp" 2>/dev/null \
+       && mv -f "$vcfg.tmp" "$vcfg"; then
+      ok "QQ 版本配置已同步（$qqver）"
+    else
+      rm -f "$vcfg.tmp" 2>/dev/null || true
+      warn "QQ 版本配置同步失败（不影响本次启动）"
+    fi
+  elif [ ! -f "$vcfg" ]; then
+    info "QQ 版本配置还没生成（首次启动会创建），跳过同步"
+  fi
+
+  [ -f "$NAPCAT_DIR/config/webui.json" ] && cp -f "$NAPCAT_DIR/config/webui.json" "$target/config/webui.json" 2>/dev/null || true
+  chmod 600 "$target"/config/*.json 2>/dev/null || true
+  ok "NapCat 已注入：$target/napcat.mjs"
+  have jq && info "QQ 当前入口：$(jq -r '.main // "未知"' "$pkg" 2>/dev/null)"
+  return 0
+}
+
+# NapCat 起不来时的一次性现场取证（Termux 层在失败后会自动调用）
+napcat_diag() {
+  local app_dir="$QQ_APP_DIR" pkg="$app_dir/package.json" log="$NAPCAT_LOG"
+  say ""
+  say "${BOLD}===== NapCat 现场诊断 =====${NC}"
+  if have jq && [ -f "$pkg" ]; then
+    info "QQ 版本：$(jq -r '.version // "未知"' "$pkg" 2>/dev/null)｜启动入口 main：$(jq -r '.main // "未知"' "$pkg" 2>/dev/null)"
+  fi
+  info "QQ 构建号：$(qq_build_version 2>/dev/null || echo 未知)"
+  info "loader：$([ -f "$app_dir/loadNapCat.js" ] && echo 有 || echo 无)｜napcat.mjs：$([ -f "$app_dir/app_launcher/napcat/napcat.mjs" ] && echo 有 || echo 无)"
+  if [ -f "$app_dir/app_launcher/index.js" ]; then
+    info "app_launcher/index.js 开头：$(head -c 90 "$app_dir/app_launcher/index.js" 2>/dev/null | tr '\n' ' ')"
+  fi
+  [ -f "$HOME/.config/QQ/versions/config.json" ] && \
+    info "QQ 版本配置：$(jq -c '{curVersion,buildId}' "$HOME/.config/QQ/versions/config.json" 2>/dev/null || echo 读取失败)"
+  info "相关进程（最多 8 行）："
+  ps -ef 2>/dev/null | grep -E 'qq|Xvfb|utility|napcat' | grep -v grep | head -8 | while IFS= read -r l; do info "$l"; done
+  if [ -f "$log" ]; then
+    info "QQ 日志开头（去重后前 20 行，看 NapCat 有没有被加载）："
+    head -n 40 "$log" 2>/dev/null | awk '!seen[$0]++' | head -20 | while IFS= read -r l; do info "$l"; done
+    info "QQ 日志末尾（去重后后 12 行）："
+    tail -n 30 "$log" 2>/dev/null | awk '!seen[$0]++' | tail -12 | while IFS= read -r l; do info "$l"; done
+  else
+    info "（没有 QQ 日志：$log）"
+  fi
+  napcat_own_log_tail 25
   return 0
 }
 
@@ -1849,8 +1995,8 @@ napcat_setup() {
 }
 EOF
   # NapCat Shell reads the config under QQ's app_launcher; keep a local copy too.
-  local launcher_cfg_dir="/opt/QQ/resources/app/app_launcher/napcat/config"
-  if [ -d "/opt/QQ/resources/app/app_launcher/napcat" ]; then
+  local launcher_cfg_dir="$QQ_APP_DIR/app_launcher/napcat/config"
+  if [ -d "$QQ_APP_DIR/app_launcher/napcat" ]; then
     mkdir -p "$launcher_cfg_dir"
     cp -f "$NAPCAT_DIR/config/onebot11_$qq.json" "$launcher_cfg_dir/onebot11_$qq.json"
   fi
@@ -1870,9 +2016,9 @@ EOF
 EOF
     chmod 600 "$webui_cfg" 2>/dev/null || true
   fi
-  if [ -d "/opt/QQ/resources/app/app_launcher/napcat" ]; then
-    cp -f "$webui_cfg" "/opt/QQ/resources/app/app_launcher/napcat/config/webui.json"
-    chmod 600 "/opt/QQ/resources/app/app_launcher/napcat/config/webui.json" 2>/dev/null || true
+  if [ -d "$QQ_APP_DIR/app_launcher/napcat" ]; then
+    cp -f "$webui_cfg" "$QQ_APP_DIR/app_launcher/napcat/config/webui.json"
+    chmod 600 "$QQ_APP_DIR/app_launcher/napcat/config/webui.json" 2>/dev/null || true
   fi
   ok "已预配置正向 WebSocket：ws://127.0.0.1:$NAPCAT_WS_PORT（仅本机）"
   info "QQ 号已记录：$qq（NapCat 登录的 QQ 必须与它一致）"
@@ -1914,16 +2060,21 @@ ensure_xvfb() {
 }
 
 # QQ 版本：NapCat 官方要求最低构建号 40768，过旧的 QQ 会在启动阶段静默崩。
+# QQ 的构建号有两种写法：package.json 里的 buildVersion，或版本号后缀
+# （3.2.34-53644 → 53644），两种都认。
 qq_build_version() {
-  local f="/opt/QQ/resources/app/package.json" v=""
+  local f="$QQ_APP_DIR/package.json" v="" b=""
   [ -f "$f" ] || return 1
   if have jq; then
-    v=$(jq -r '.buildVersion // empty' "$f" 2>/dev/null)
+    v=$(jq -r '.buildVersion // empty' "$f" 2>/dev/null || true)
+    [ -n "$v" ] || v=$(jq -r '.version // empty' "$f" 2>/dev/null || true)
   else
     v=$(sed -n 's/.*"buildVersion"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9]\+\)"\{0,1\}.*/\1/p' "$f" 2>/dev/null | head -1)
+    [ -n "$v" ] || v=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
   fi
-  case "$v" in ''|*[!0-9]*) return 1 ;; esac
-  printf '%s\n' "$v"
+  b="${v##*-}"
+  case "$b" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$b"
 }
 
 napcat_start() {
@@ -1935,6 +2086,22 @@ napcat_start() {
   if napcat_port_open 6099 || napcat_port_open "$NAPCAT_WS_PORT"; then
     warn "NapCat 已在运行"
     return 0
+  fi
+  # 注入没做好时 QQ 能起来、NapCat 一行 JS 都不跑：与其等几分钟超时，
+  # 不如在启动前就说清楚（这是"QQ 进程在、6099 永远不监听"的常见原因）。
+  if [ ! -f "$QQ_APP_DIR/app_launcher/napcat/napcat.mjs" ]; then
+    err "NapCat 没有注入到 QQ（缺 $QQ_APP_DIR/app_launcher/napcat/napcat.mjs）"
+    info "请点「安装 NapCat」重新注入（幂等、很快），或在容器里执行：bash \$0 napcat-inject"
+    return 1
+  fi
+  if have jq; then
+    local qq_main
+    qq_main=$(jq -r '.main // empty' $QQ_APP_DIR/package.json 2>/dev/null || true)
+    case "$qq_main" in
+      ""|*loadNapCat*) : ;;
+      *) warn "QQ 启动入口是 $qq_main（不是 loadNapCat.js），NapCat 可能不会被加载"
+         info "建议点「安装 NapCat」重新注入后再启动" ;;
+    esac
   fi
   if qq_process_running; then
     warn "QQ 进程在，但 WebUI 端口（6099）和 WS 端口（$NAPCAT_WS_PORT）都没监听"
@@ -1956,7 +2123,7 @@ ulimit -c 0 2>/dev/null || true
 # 否则"preload 之后什么都不打印"就永远查不出原因
 export ELECTRON_ENABLE_LOGGING=1
 cd "$NAPCAT_DIR" || exit 1
-QQBIN="\$(command -v qq || echo /opt/QQ/qq)"
+QQBIN="\$(command -v qq || echo $QQ_BIN)"
 echo "[\$(date '+%F %T')] 启动 QQ：\$QQBIN $QQ_LAUNCH_FLAGS -q $ACCOUNT（DISPLAY=\$DISPLAY）" | tee -a "$NAPCAT_LOG"
 "\$QQBIN" $QQ_LAUNCH_FLAGS -q "$ACCOUNT" 2>&1 | tee -a "$NAPCAT_LOG"
 rc=\${PIPESTATUS[0]}
@@ -1983,7 +2150,7 @@ EOF
 # NapCat 自己的日志（NapCat 会把启动异常写进 logs/*.log，stdout 不一定有）
 napcat_own_log_tail() {
   local f newest="" lines="${1:-20}"
-  for f in "$NAPCAT_DIR"/logs/*.log /opt/QQ/resources/app/app_launcher/napcat/logs/*.log; do
+  for f in "$NAPCAT_DIR"/logs/*.log $QQ_APP_DIR/app_launcher/napcat/logs/*.log; do
     [ -f "$f" ] || continue
     if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
   done
@@ -2045,7 +2212,7 @@ napcat_webui() {
     return 0
   fi
   # NapCat Shell 的 config 目录位于启动器目录；也检查本脚本独立 NapCat 目录。
-  cfg="/opt/QQ/resources/app/app_launcher/napcat/config/webui.json"
+  cfg="$QQ_APP_DIR/app_launcher/napcat/config/webui.json"
   [ -f "$cfg" ] || cfg="$NAPCAT_DIR/config/webui.json"
   token=""
   if [ -f "$cfg" ]; then
@@ -2335,9 +2502,9 @@ menu() {
     say "  18)启动全部 19)停止全部"
     warn "容器内直接启动只会跑在本次 login 的前台；常驻请用 App 或在 Termux 执行 guard"
     say "  --- 连接检查 ---"
-    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖 25)清理残留 26)重装QQ 27)镜像测速"
+    say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖 25)清理残留 26)重装QQ 27)镜像测速 28)重注入NapCat 29)NapCat现场诊断"
     say "  0)退出"
-    printf '请输入 [0-27]：'
+    printf '请输入 [0-29]：'
     read -r n
     case "$n" in
       1) check;; 2) install;; 3) update;; 4) start;; 5) fg_run;; 6) stop;;
@@ -2347,6 +2514,7 @@ menu() {
       18) allstart;; 19) allstop;;
       20) webui_check;; 21) adapter_setup "${2:-}";; 22) adapter_status;; 23) doctor;; 24) fix_deps;;
       25) reset_sessions;; 26) MAIBOT_QQ_REINSTALL=1 napcat_install;; 27) mirrors_check;;
+      28) napcat_inject;; 29) napcat_diag;;
       0|q|Q) say "再见"; break;; *) warn "无效输入";;
     esac
   done
@@ -2370,6 +2538,8 @@ case "$RUN_ACTION" in
   allstop)        allstop ;;
   wd|watchdog)    watchdog ;;
   napcat-install) napcat_install ;;
+  napcat-inject)  napcat_inject ;;
+  napcat-diag)    napcat_diag ;;
   napcat-qq)      MAIBOT_QQ_REINSTALL=1 napcat_install ;;
   napcat-setup)   napcat_setup "${2:-}" ;;
   napcat-start)   napcat_start ;;
