@@ -357,18 +357,49 @@ EOF
   return 1
 }
 
+# 修复被 dpkg -i --force-depends / 中断的 apt 留下的半坏状态。
+# 症状：apt 报 "You might want to run 'apt --fix-broken install'"、
+# "Depends: xxx but it is not going to be installed"，之后任何组件都装不上。
+repair_dpkg_state() {
+  export DEBIAN_FRONTEND=noninteractive
+  local broken=0
+  dpkg --audit 2>/dev/null | grep -q . && broken=1
+  dpkg -C 2>/dev/null | grep -q . && broken=1
+  [ "$broken" = "1" ] || return 0
+  warn "检测到 dpkg/apt 处于半坏状态（多半是之前 --force-depends 装的 QQ 留下的），先修复 ..."
+  run_logged dpkg --configure -a || true
+  run_logged apt-get $APT_OPTS install -y -f || true
+  if dpkg --audit 2>/dev/null | grep -q .; then
+    warn "仍有未配置完的包，继续尝试（下面这一步如果失败，请把日志发出来）"
+  else
+    ok "dpkg/apt 状态已修复"
+  fi
+  return 0
+}
+
 # 统一的 apt 安装（非交互 + 失败明确报错）
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   info "安装系统组件：$*"
   apt_wait_unlock || return 1
+  repair_dpkg_state
   if ! run_logged apt-get $APT_OPTS update -y; then
     err "软件包索引更新失败，请检查网络后重试"
     return 1
   fi
   if ! run_logged apt-get $APT_OPTS install -y --no-install-recommends "$@"; then
-    err "组件安装失败：$*"
-    return 1
+    warn "组件安装失败，先尝试修复依赖关系再重试一次 ..."
+    run_logged dpkg --configure -a || true
+    if ! run_logged apt-get $APT_OPTS install -y -f; then
+      err "组件安装失败：$*"
+      info "常见原因：上一次用 dpkg -i --force-depends 装的包留下未满足的依赖"
+      info "可在容器里手动执行：dpkg --configure -a; apt-get install -y -f"
+      return 1
+    fi
+    if ! run_logged apt-get $APT_OPTS install -y --no-install-recommends "$@"; then
+      err "组件安装失败：$*（依赖已尝试修复）"
+      return 1
+    fi
   fi
   ok "组件就绪：$*"
   return 0
@@ -589,84 +620,302 @@ if [ -n "${PREFIX:-}" ]; then
     ok "初始化完成！"
   }
 
-  # ---------- Termux 层守护：唤醒锁 + 独立 screen 会话 ----------
-  termux_guard() {
-    local sub="$1"
-    case "$sub" in
-      guard-stop)
-        screen -S maibot-watchdog -X quit >/dev/null 2>&1
-        have termux-wake-lock && termux-wake-unlock >/dev/null 2>&1
-        local rc=0
-        proot-distro login debian --bind "$HOME:/termux-home" \
-          -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
-          MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" bash /termux-home/maibot-onekey.sh allstop || rc=1
-        if [ "$rc" -ne 0 ]; then
-          err "停止服务时有步骤失败，请查看上方输出"
-          return 1
-        fi
-        ok "已停止全部服务与守护"
-        return 0
-        ;;
-    esac
+  # ============================================================
+  #  Termux 层服务管理（这一层才是关键）
+  #
+  #  proot-distro login 默认带 `--kill-on-exit`：这条命令一退出，本次 login 里
+  #  启动的所有进程（screen / Xvfb / QQ / MaiBot）会被一起杀掉。旧架构在容器里
+  #  `screen -dmS` 之后就让 login 退出，于是出现"日志说启动成功、一打开 WebUI
+  #  就报未运行"，容器里只剩一堆 Dead 空壳会话 —— 这就是那个 bug 的根因。
+  #
+  #  正确做法（与 NapCat 官方 Termux 配方一致）：把服务跑在**本次 login 的前台**，
+  #  再用 Termux 自己的 screen 会话托住整条 proot 进程链：
+  #  proot 活多久服务就活多久，停服务 = 结束这个 screen 会话。
+  # ============================================================
+  TERMUX_BOT_SCREEN="maibot"
+  TERMUX_NAPCAT_SCREEN="napcat"
+  TERMUX_WD_SCREEN="maibot-watchdog"
 
+  termux_screen_state() {
+    local name="$1" line
+    line=$(screen -ls 2>/dev/null | grep -E "[.]${name}[[:space:]]" | head -1)
+    [ -n "$line" ] || { printf 'none'; return 0; }
+    case "$line" in
+      *Dead*) printf 'dead' ;;
+      *)      printf 'live' ;;
+    esac
+  }
+  # 端口在 Termux 和容器之间是同一个 loopback，Termux 层直接探就行
+  termux_port_open() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+  }
+  termux_log_tail() {
+    local file="$1" lines="${2:-15}"
+    [ -f "$file" ] || { info "（没有日志文件：$file）"; return 0; }
+    tail -n "$lines" "$file" 2>/dev/null | while IFS= read -r l; do info "$l"; done
+  }
+  termux_service_up() {
+    case "$1" in
+      bot)    termux_port_open 8001 ;;
+      napcat) termux_port_open 6099 || termux_port_open 3001 ;;
+      *) return 1 ;;
+    esac
+  }
+  termux_service_label() {
+    [ "$1" = "bot" ] && printf 'MaiBot' || printf 'NapCat'
+  }
+  # 生成"前台跑服务"的启动器：由 Termux 侧 screen 会话执行
+  termux_write_runner() {
+    local name="$1" action="$2" extra="${3:-}" f="$HOME/.maibot-serve-$1.sh"
+    cat > "$f" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+# 由 MaiBot 一键部署生成，每次启动都会重写，不要手改。
+# 服务必须留在本次 proot login 的前台，否则 login 退出会把服务一起清掉。
+exec proot-distro login debian --bind "\$HOME:/termux-home" -- env \\
+  MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \\
+  MAIBOT_NESTED=1 MAIBOT_QUERY=0 $extra \\
+  bash /termux-home/maibot-onekey.sh $action
+EOF
+    chmod +x "$f" 2>/dev/null || true
+  }
+
+  # 启动一个服务并等端口就绪；$2 可传额外环境变量
+  termux_service_start() {
+    local svc="$1" extra="${2:-}" name action log waited=0 seen=0
+    case "$svc" in
+      bot)    name="$TERMUX_BOT_SCREEN";    action="start";        log="$HOME/maibot-bot.log" ;;
+      napcat) name="$TERMUX_NAPCAT_SCREEN"; action="napcat-start"; log="$HOME/maibot-napcat.log" ;;
+      *) err "未知服务：$svc"; return 1 ;;
+    esac
+    if termux_service_up "$svc"; then
+      ok "$(termux_service_label "$svc") 已在运行"
+      return 0
+    fi
     if ! have proot-distro; then
       err "环境未初始化，请先运行：bash ~/maibot-onekey.sh setup"
       return 1
     fi
-
-    # 1) 唤醒锁：锁屏后 CPU 不被冻结
-    if have termux-wake-lock; then
-      termux-wake-lock >/dev/null 2>&1 && ok "Termux 唤醒锁已获取（锁屏不冻结）"
+    screen -wipe >/dev/null 2>&1 || true
+    if [ "$(termux_screen_state "$name")" = live ]; then
+      warn "检测到旧的 $name 会话但端口未监听，先清理再启动"
+      screen -S "$name" -X quit >/dev/null 2>&1 || true
+      screen -wipe >/dev/null 2>&1 || true
     fi
+    termux_write_runner "$name" "$action" "$extra"
+    : > "$log" 2>/dev/null || true
+    screen -dmS "$name" bash -c "bash '$HOME/.maibot-serve-$name.sh' 2>&1 | tee -a '$log'"
+    if [ "$svc" = "bot" ]; then
+      info "等待 MaiBot WebUI（8001），最多 180 秒 ..."
+    else
+      info "等待 NapCat WebUI（6099 / WS 3001），最多 180 秒 ..."
+    fi
+    while [ "$waited" -lt 180 ]; do
+      sleep 1
+      waited=$((waited + 1))
+      termux_service_up "$svc" && break
+      if [ "$(termux_screen_state "$name")" = live ]; then
+        seen=1
+      elif [ "$seen" = 1 ] || [ "$waited" -ge 5 ]; then
+        # 会话已经没了（进程退出），再等也没用
+        break
+      fi
+    done
+    if termux_service_up "$svc"; then
+      ok "$(termux_service_label "$svc") 已启动"
+      return 0
+    fi
+    err "$(termux_service_label "$svc") 没能就绪，日志末尾（$log）："
+    termux_log_tail "$log" 20
+    return 1
+  }
 
-    # 2) 拉起容器内全部服务（幂等）
-    info "启动 MaiBot 与 NapCat ..."
-    local start_rc=0
-    proot-distro login debian --bind "$HOME:/termux-home" \
-      -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
-          MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" bash /termux-home/maibot-onekey.sh allstart || start_rc=1
+  # 停止一个服务：结束 Termux 侧会话即可（proot 的 --kill-on-exit 会连带清掉容器内进程）
+  termux_service_stop() {
+    local svc="$1" quiet="${2:-}" name action
+    case "$svc" in
+      bot)    name="$TERMUX_BOT_SCREEN";    action="stop" ;;
+      napcat) name="$TERMUX_NAPCAT_SCREEN"; action="napcat-stop" ;;
+      *) err "未知服务：$svc"; return 1 ;;
+    esac
+    screen -S "$name" -X quit >/dev/null 2>&1 || true
+    screen -wipe >/dev/null 2>&1 || true
+    # 容器里可能还有你手动起的进程 / 空壳会话，让容器层再清一次
+    if have proot-distro; then
+      proot-distro login debian --bind "$HOME:/termux-home" \
+        -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+             MAIBOT_NESTED=1 MAIBOT_QUERY=1 \
+        bash /termux-home/maibot-onekey.sh "$action" >/dev/null 2>&1 || true
+    fi
+    [ -n "$quiet" ] || ok "$(termux_service_label "$svc") 已停止"
+    return 0
+  }
 
-    # 3) 独立守护会话：即使本 App 被杀，容器内也会自我恢复
+  termux_wake_lock() {
+    have termux-wake-lock && termux-wake-lock >/dev/null 2>&1 || true
+  }
+
+  # MaiBot：先在容器里把依赖同步好（这一步可能几分钟，单独一次 login，
+  # 进度会实时写进 App 日志），再拉起前台服务，避免同步时间超过等待上限。
+  termux_start_bot() {
+    termux_wake_lock
+    if termux_service_up bot; then
+      ok "MaiBot 已在运行"
+      return 0
+    fi
+    if have proot-distro; then
+      info "同步 MaiBot 依赖 ..."
+      proot-distro login debian --bind "$HOME:/termux-home" \
+        -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+             MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" \
+        bash /termux-home/maibot-onekey.sh prepare-bot || return 1
+    fi
+    termux_service_start bot
+  }
+
+  # NapCat：Worker 在 proot 里 fork 失败时会静默卡住，失败自动用单进程模式重试一次
+  termux_start_napcat() {
+    termux_wake_lock
+    if termux_service_up napcat; then
+      ok "NapCat 已在运行"
+      return 0
+    fi
+    if termux_service_start napcat; then
+      return 0
+    fi
+    warn "第一次没起来，改用「单进程模式」重试一次（跳过 utilityProcess.fork）"
+    termux_service_stop napcat quiet
+    termux_service_start napcat "NAPCAT_DISABLE_MULTI_PROCESS=1"
+  }
+
+  termux_services_start_all() {
+    local rc=0
+    termux_start_bot || rc=1
+    termux_start_napcat || rc=1
+    return "$rc"
+  }
+
+  termux_guard_start() {
+    if ! have proot-distro; then
+      err "环境未初始化，请先运行：bash ~/maibot-onekey.sh setup"
+      return 1
+    fi
+    termux_wake_lock && have termux-wake-lock && ok "Termux 唤醒锁已获取（锁屏不冻结）"
+    local rc=0
+    termux_services_start_all || rc=1
+    # 守护会话放在 Termux 层：App 被杀、容器重建都还能自愈
     if have screen; then
-      if screen -ls 2>/dev/null | grep -q "[.]maibot-watchdog"; then
+      if [ "$(termux_screen_state "$TERMUX_WD_SCREEN")" = live ]; then
         ok "守护进程已在运行"
       else
-        screen -dmS maibot-watchdog bash "$HOME/maibot-onekey.sh" wd
+        screen -S "$TERMUX_WD_SCREEN" -X quit >/dev/null 2>&1 || true
+        screen -wipe >/dev/null 2>&1 || true
+        screen -dmS "$TERMUX_WD_SCREEN" bash "$HOME/maibot-onekey.sh" wd
         sleep 2
-        screen -ls 2>/dev/null | grep -q "[.]maibot-watchdog" \
+        [ "$(termux_screen_state "$TERMUX_WD_SCREEN")" = live ] \
           && ok "守护进程已启动（掉线自动拉起）" || warn "守护进程启动失败"
       fi
     else
       warn "未安装 screen，跳过守护进程（可执行 pkg install screen）"
     fi
-
-    if [ "$start_rc" -ne 0 ]; then
+    if [ "$rc" -ne 0 ]; then
       say ""
       err "服务未能全部启动（守护已就绪）。请查看上方 [错误] 行处理后重试。"
       return 1
     fi
-
     say ""
     ok "服务器模式已开启：只要手机有电，MaiBot 就会持续运行"
     info "关闭请执行：bash $0 guard-stop"
     return 0
   }
 
+  termux_guard_stop() {
+    screen -S "$TERMUX_WD_SCREEN" -X quit >/dev/null 2>&1 || true
+    screen -wipe >/dev/null 2>&1 || true
+    have termux-wake-lock && termux-wake-unlock >/dev/null 2>&1
+    termux_service_stop bot quiet
+    termux_service_stop napcat quiet
+    ok "已停止全部服务与守护"
+    return 0
+  }
+
+  # 守护进程（Termux 层）：探端口，掉了就重新拉起
+  termux_watchdog() {
+    local interval="${1:-60}" last_bot=0 last_nc=0 now
+    say "Termux 守护进程：每 ${interval} 秒检查 8001 / 6099 / 3001，掉线自动拉起"
+    while true; do
+      now=$(date +%s 2>/dev/null || echo 0)
+      if ! termux_port_open 8001 && [ $((now - last_bot)) -ge 180 ]; then
+        warn "$(date '+%m-%d %H:%M:%S') MaiBot 掉线，自动拉起"
+        termux_start_bot
+        last_bot=$now
+      fi
+      if ! termux_port_open 6099 && ! termux_port_open 3001 && [ $((now - last_nc)) -ge 180 ]; then
+        warn "$(date '+%m-%d %H:%M:%S') NapCat 掉线，自动拉起"
+        termux_start_napcat
+        last_nc=$now
+      fi
+      sleep "$interval"
+    done
+  }
+
+  termux_state_report() {
+    say ""
+    say "${BOLD}===== Termux 层状态（服务会话在这里）=====${NC}"
+    info "会话 $TERMUX_BOT_SCREEN：$(termux_screen_state "$TERMUX_BOT_SCREEN")"
+    info "会话 $TERMUX_NAPCAT_SCREEN：$(termux_screen_state "$TERMUX_NAPCAT_SCREEN")"
+    info "会话 $TERMUX_WD_SCREEN：$(termux_screen_state "$TERMUX_WD_SCREEN")"
+    info "8001（MaiBot WebUI）：$(termux_port_open 8001 && echo 已监听 || echo 未监听)"
+    info "6099（NapCat WebUI）：$(termux_port_open 6099 && echo 已监听 || echo 未监听)"
+    info "3001（NapCat WS）：$(termux_port_open 3001 && echo 已监听 || echo 未监听)"
+    say "  （会话 live=服务在跑，dead=只剩空壳；下面是容器内的详细诊断）"
+  }
+
   _LAYER_RC=0
-  if [ "${1:-menu}" = "setup" ]; then
-    termux_setup; _LAYER_RC=$?
-  elif [ "${1:-}" = "guard" ] || [ "${1:-}" = "guard-stop" ] || [ "${1:-}" = "wake" ]; then
-    termux_guard "${1:-}"; _LAYER_RC=$?
-  else
-    # 非 setup 命令：进容器执行同一脚本同一子命令
-    if ! have proot-distro; then
-      err "未安装 proot-distro，请先运行：bash ~/maibot-onekey.sh setup"
-      exit 1
-    fi
-    proot-distro login debian --bind "$HOME:/termux-home" -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
-          MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" bash /termux-home/maibot-onekey.sh "$@"
-    _LAYER_RC=$?
-  fi
+  case "${1:-menu}" in
+    setup)        termux_setup; _LAYER_RC=$? ;;
+    guard)        termux_guard_start; _LAYER_RC=$? ;;
+    guard-stop)   termux_guard_stop; _LAYER_RC=$? ;;
+    wake)         termux_wake_lock; _LAYER_RC=$? ;;
+    start)        termux_start_bot; _LAYER_RC=$? ;;
+    stop)         termux_service_stop bot; _LAYER_RC=$? ;;
+    restart)      termux_service_stop bot quiet; termux_start_bot; _LAYER_RC=$? ;;
+    napcat-start) termux_start_napcat; _LAYER_RC=$? ;;
+    napcat-stop)  termux_service_stop napcat; _LAYER_RC=$? ;;
+    allstart)     termux_services_start_all; _LAYER_RC=$? ;;
+    allstop)      termux_service_stop bot quiet; termux_service_stop napcat; _LAYER_RC=$? ;;
+    wd|watchdog)  termux_watchdog; _LAYER_RC=$? ;;
+    reset)
+      termux_service_stop bot quiet
+      termux_service_stop napcat quiet
+      if have proot-distro; then
+        proot-distro login debian --bind "$HOME:/termux-home" \
+          -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+               MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" \
+          bash /termux-home/maibot-onekey.sh reset
+        _LAYER_RC=$?
+      fi
+      ;;
+    doctor|status)
+      termux_state_report
+      proot-distro login debian --bind "$HOME:/termux-home" \
+        -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+             MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" \
+        bash /termux-home/maibot-onekey.sh "$@"
+      _LAYER_RC=$?
+      ;;
+    *)
+      # 其余动作（安装、查询、诊断…）：进容器执行同一脚本同一子命令
+      if ! have proot-distro; then
+        err "未安装 proot-distro，请先运行：bash ~/maibot-onekey.sh setup"
+        exit 1
+      fi
+      proot-distro login debian --bind "$HOME:/termux-home" \
+        -- env MAIBOT_STATE_HOME=/termux-home MAIBOT_LOG=/termux-home/.maibot-run.log \
+             MAIBOT_NESTED=1 MAIBOT_QUERY="${MAIBOT_QUERY:-0}" \
+        bash /termux-home/maibot-onekey.sh "$@"
+      _LAYER_RC=$?
+      ;;
+  esac
   # 把真实退出码交给 App：App 用它判断"这次初始化/操作到底成功没有"
   exit "$_LAYER_RC"
 fi
@@ -694,10 +943,7 @@ LOG_FILE="$BOT_DIR/logs/mai.log"
 # ---------- NapCat 配置 ----------
 NAPCAT_DIR="$HOME/NapCat.linux.arm64"
 NAPCAT_SCREEN="napcat"
-# Xvfb 单独一个会话：以前它挂在 QQ 的启动脚本里，QQ 一崩脚本就退出，
-# 显示 :1 跟着消失，之后每次启动都更难点亮。
-XVFB_SCREEN="napcat-xvfb"
-NAPCAT_LOG="$HOME/napcat.log"
+NAPCAT_LOG="$STATE_HOME/maibot-napcat.log"
 NAPCAT_ENV="$HOME/.env"
 # QQ 安装包地址与最低构建号见上方「镜像加速」段（LINUXQQ_URL / QQ_MIN_BUILD）
 NAPCAT_FALLBACK_VERSION="v4.18.42"
@@ -1048,17 +1294,16 @@ stop_maibot() {
   return 0
 }
 
-# 启动 MaiBot。
-# 关键：不要用 `uv run` 启动。uv 运行前会同步环境并构建/安装项目本身
-# （日志里只有一行 "Building maibot @ file://..."）；构建后端要走 build isolation
-# 下载 setuptools，国内经常直接卡死，于是永远起不来、8001 永远不监听。
-# 依赖已经 uv sync 过，这里直接复刻 uv run 的运行环境（VIRTUAL_ENV / PATH / .env），
-# 用虚拟环境解释器启动，全程不联网、不构建。
+# 前台运行 MaiBot —— 由 Termux 侧的 screen 会话托管。
+# 千万不要在这里再套一层"容器内 screen"：proot-distro login 默认带
+# `--kill-on-exit`，login 一退出，本次 login 里启动的 screen / MaiBot 会被
+# 一起杀掉。旧版本「日志显示启动成功，一打开 WebUI 就说未运行」就是这么来的。
+# 服务必须留在本次 login 的前台：proot 活多久，服务就活多久。
 start() {
   [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
+  [ -f "$BOT_DIR/bot.py" ] || { err "找不到 $BOT_DIR/bot.py：点「更新 MaiBot」或重新部署"; return 1; }
   if [ ! -f "$BOT_DIR/data/webui.json" ]; then
     # 新版 MaiBot 不再需要前台确认协议，webui.json 由 WebUI 服务启动时生成。
-    # 这里只提示、不拦截：拦下来只会让「启动」永远点不动。
     warn "还没有 data/webui.json（首次启动会由 MaiBot 自己生成）"
     info "启动后用「查看密钥」或 bash $0 token 取 WebUI 登录密钥"
   fi
@@ -1066,8 +1311,7 @@ start() {
     ok "MaiBot 已在运行，WebUI http://127.0.0.1:8001"
     return 0
   fi
-  # 会话在、8001 却没监听：要么卡在依赖构建，要么只是重启后留下的空壳。
-  # 旧版本在这里直接说"已在运行"就返回，用户怎么点都起不来。
+  # 会话在、8001 却没监听：要么是上次留下的空壳，要么还在启动
   screen_wipe_dead
   if screen_session_running "$SCREEN_NAME" || maibot_process_running; then
     warn "检测到旧的 MaiBot 会话/进程，但 8001 没在监听，先清理再启动"
@@ -1076,48 +1320,31 @@ start() {
   mkdir -p "$BOT_DIR/logs"
   info "虚拟环境：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失，将由 uv sync 创建)"
   sync_deps || return 1
-  if [ ! -f "$BOT_DIR/bot.py" ]; then
-    err "找不到 $BOT_DIR/bot.py，源码不完整：点「更新 MaiBot」或重新部署"
+  local py="$BOT_DIR/.venv/bin/python"
+  if [ ! -x "$py" ]; then
+    err "虚拟环境里没有 Python 解释器（.venv 不完整）：点「修复依赖」重建，或先在容器里执行 uv sync"
     return 1
   fi
   cd "$BOT_DIR" || return 1
-  local launch
-  if [ -x "$BOT_DIR/.venv/bin/python" ]; then
-    # PYTHONUNBUFFERED：输出经 tee 落盘，不设的话日志会攒在缓冲区里，看不出进度
-    launch="cd '$BOT_DIR' || exit 1; export VIRTUAL_ENV='$BOT_DIR/.venv' PATH='$BOT_DIR/.venv/bin':\$PATH PYTHONUNBUFFERED=1 PYTHONUTF8=1; if [ -f .env ]; then set -a; . ./.env; set +a; fi; '$BOT_DIR/.venv/bin/python' -u bot.py"
-  else
-    warn "虚拟环境里没有 Python 解释器，退回 uv run（会重新同步，可能很慢）"
-    launch="cd '$BOT_DIR' || exit 1; PYTHONUNBUFFERED=1 env UV_DEFAULT_INDEX='$PY_INDEX_URL' UV_INDEX_URL='$PY_INDEX_URL' uv run --no-sync python bot.py"
-  fi
-  # 把真正执行的命令行写进日志：以后排查不用再猜用的是哪种启动方式
-  info "启动命令：$launch"
-  screen -dmS "$SCREEN_NAME" bash -c "$launch 2>&1 | tee '$LOG_FILE'"
-  info "等待 WebUI 监听 8001（最多 120 秒）..."
-  local waited=0 seen=0
-  while [ "$waited" -lt 120 ]; do
-    sleep 1
-    waited=$((waited + 1))
-    maibot_port_open && break
-    # 刚拉起的一瞬间进程还没建出来，所以"见过它活着、之后又消失"才算真失败
-    if maibot_process_running || screen_session_running "$SCREEN_NAME"; then
-      seen=1
-    elif [ "$seen" = 1 ]; then
-      break
-    fi
-  done
-  if maibot_port_open; then
-    ok "MaiBot 已启动，WebUI http://127.0.0.1:8001"
-    return 0
-  fi
-  if maibot_process_running; then
-    warn "进程在运行，但 120 秒内 8001 仍未监听"
-  else
-    err "MaiBot 进程已退出，启动失败"
-  fi
-  info "本地日志末尾（${LOG_FILE}）："
-  webui_log_tail "$LOG_FILE" 25
-  info "处理：点「修复依赖」→「启动 MaiBot」；仍不行点「连接诊断」并把输出发出来"
-  return 1
+  export VIRTUAL_ENV="$BOT_DIR/.venv"
+  export PATH="$BOT_DIR/.venv/bin:$PATH"
+  export PYTHONUNBUFFERED=1 PYTHONUTF8=1
+  if [ -f .env ]; then set -a; . ./.env; set +a; fi
+  info "启动：$py -u bot.py（前台运行；输出同时写入 $LOG_FILE）"
+  "$py" -u bot.py 2>&1 | tee "$LOG_FILE"
+  local rc=${PIPESTATUS[0]}
+  warn "MaiBot 已退出（退出码 $rc）"
+  return "$rc"
+}
+
+# 只同步依赖，不启动（Termux 层在拉起服务前单独调一次，
+# 这样"依赖同步很久"不会撞上启动等待超时）
+prepare_bot() {
+  [ -d "$BOT_DIR" ] || { err "尚未部署，先 install"; return 1; }
+  [ -f "$BOT_DIR/bot.py" ] || { err "找不到 $BOT_DIR/bot.py：点「更新 MaiBot」或重新部署"; return 1; }
+  mkdir -p "$BOT_DIR/logs"
+  info "虚拟环境：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失，将由 uv sync 创建)"
+  sync_deps
 }
 
 fg_run() {
@@ -1273,8 +1500,8 @@ doctor() {
   say ""
   say "--- MaiBot ---"
   # live=里面真的有进程；dead=进程早退了只剩空壳（旧版本会误判成"在运行"）；none=没有
-  info "screen 会话 $SCREEN_NAME：$(screen_session_state "$SCREEN_NAME")"
-  info "守护会话 maibot-watchdog：$(screen_session_state maibot-watchdog)"
+  info "容器内 screen 会话 $SCREEN_NAME：$(screen_session_state "$SCREEN_NAME")（服务会话在 Termux 层）"
+  info "容器内守护会话 maibot-watchdog：$(screen_session_state maibot-watchdog)"
   info "bot.py 进程：$(maibot_process_running && echo 有 || echo 无)"
   info "8001 端口：$(maibot_port_open && echo 已监听 || echo 未监听)"
   info "虚拟环境 .venv：$([ -x "$BOT_DIR/.venv/bin/python" ] && echo 已就绪 || echo 缺失)"
@@ -1291,8 +1518,7 @@ doctor() {
   webui_log_tail "$LOG_FILE" 15
   say ""
   say "--- NapCat ---"
-  info "screen 会话 $NAPCAT_SCREEN：$(screen_session_state "$NAPCAT_SCREEN")"
-  info "Xvfb 会话 $XVFB_SCREEN：$(screen_session_state "$XVFB_SCREEN")"
+  info "screen 会话 $NAPCAT_SCREEN：$(screen_session_state "$NAPCAT_SCREEN")（容器内；服务会话在 Termux 层）"
   info "QQ 进程：$(qq_process_running && echo 有 || echo 无)"
   info "Xvfb 显示 :1：$(xvfb_running && echo 有 || echo 无)"
   info "相关进程（最多 6 行）："
@@ -1330,6 +1556,7 @@ doctor() {
   done
   [ -n "$missing" ] && warn "缺失动态库：$missing（QQ 会在启动阶段直接崩，需要补依赖）" || info "动态库：/opt/QQ 依赖完整"
   [ -d "$HOME/.config/QQ/crash_files" ] && info "崩溃转储：$(ls -t "$HOME/.config/QQ/crash_files" 2>/dev/null | head -3 | tr '\n' ' ')"
+  napcat_own_log_tail 8
   say ""
   say "--- 为什么会变成这样 ---"
   # Dead 会话 = 进程早就退了，只剩空壳；这正是"以前能用、现在不动"的典型现场
@@ -1491,13 +1718,18 @@ napcat_install() {
       fi
     fi
     info "安装 Linux QQ 包 ..."
-    if run_logged dpkg -i --force-depends /tmp/linuxqq.deb; then
-      ok "Linux QQ 安装完成"
+    # 优先用 apt 装本地 deb：它会自动从仓库补齐依赖（xdg-utils 等）。
+    # 直接用 dpkg -i --force-depends 会把依赖跳过，留下
+    # "Depends: xdg-utils but it is not going to be installed" 这种半坏状态，
+    # 之后连 curl / xauth 都装不上（用户实际踩过）。
+    if run_logged apt-get $APT_OPTS install -y /tmp/linuxqq.deb; then
+      ok "Linux QQ 安装完成（依赖已自动补齐）"
     else
-      warn "dpkg 有警告，尝试补齐依赖 ..."
-      run_logged apt-get install -y -f || { err "Linux QQ 依赖修复失败"; return 1; }
+      warn "apt 安装本地包失败，改用 dpkg 并立刻补齐依赖 ..."
+      run_logged dpkg -i --force-depends /tmp/linuxqq.deb || true
+      run_logged apt-get $APT_OPTS install -y -f || warn "补依赖失败，可稍后重试"
       [ -f "/opt/QQ/qq" ] || { err "Linux QQ 安装失败"; return 1; }
-      ok "Linux QQ 安装完成（已补齐依赖）"
+      ok "Linux QQ 安装完成（已尝试补齐依赖）"
     fi
     rm -f /tmp/linuxqq.deb
     # dpkg -i --force-depends 会跳过依赖：缺库时 QQ 会在启动阶段静默崩掉，
@@ -1661,16 +1893,15 @@ xvfb_running() {
   pgrep -f 'Xvfb :1' >/dev/null 2>&1
 }
 
-XVFB_LOG="$HOME/xvfb.log"
+XVFB_LOG="$STATE_HOME/maibot-xvfb.log"
 
-# Xvfb 用独立会话常驻：QQ 崩了它还在，重新启动 NapCat 时不用再等显示就绪。
-# 崩过之后 /tmp/.X1-lock 会残留，不清掉 Xvfb 会直接拒绝启动（这是"以前能用、
-# 现在显示起不来"的常见原因）。
+# Xvfb 作为本次 login 的后台子进程启动：DISPLAY=:1 只要在服务存活期间有效即可，
+# 由 Termux 侧的 screen 会话（跑 proot）保证整条进程链不会被 kill-on-exit 清掉。
+# 崩过之后 /tmp/.X1-lock 会残留，不清掉 Xvfb 会直接拒绝启动。
 ensure_xvfb() {
   xvfb_running && return 0
   rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null || true
-  screen_drop "$XVFB_SCREEN"
-  screen -dmS "$XVFB_SCREEN" bash -c "ulimit -c 0 2>/dev/null; Xvfb :1 -screen 0 1080x760x16 +extension GLX +render > '$XVFB_LOG' 2>&1"
+  ( ulimit -c 0 2>/dev/null; Xvfb :1 -screen 0 1080x760x16 +extension GLX +render >"$XVFB_LOG" 2>&1 & ) || true
   local waited=0
   while [ "$waited" -lt 15 ]; do
     sleep 1
@@ -1732,33 +1963,36 @@ rc=\${PIPESTATUS[0]}
 sig=""
 [ "\$rc" -gt 128 ] 2>/dev/null && sig="（被信号 \$((rc - 128)) 杀死）"
 echo "[\$(date '+%F %T')] QQ 进程已退出，退出码 \$rc\$sig；139/134/132=原生崩溃，137=内存不足被杀，1=普通报错" | tee -a "$NAPCAT_LOG"
+# 把 QQ 的真实退出码传出去（否则最后一条 echo 的 0 会盖掉它）
+exit "\$rc"
 EOF
   chmod +x "$NAPCAT_DIR/start_qq.sh"
   : > "$NAPCAT_LOG" 2>/dev/null || true
   sync_napcat_config
-  screen -dmS "$NAPCAT_SCREEN" "$NAPCAT_DIR/start_qq.sh"
-  local waited=0 webui_port="" seen=0
-  while [ "$waited" -lt 60 ]; do
-    sleep 1
-    waited=$((waited + 1))
-    webui_port=$(napcat_webui_port 2>/dev/null || true)
-    [ -n "$webui_port" ] && break
-    if qq_process_running; then
-      seen=1
-    elif [ "$seen" = 1 ]; then
-      # QQ 起来过又没了：不用再等，日志里已经有退出码
-      break
-    fi
+  info "启动 NapCat：QQ $ACCOUNT，DISPLAY=:1（前台运行，由 Termux 会话托管）"
+  "$NAPCAT_DIR/start_qq.sh"
+  local rc=$?
+  warn "NapCat 已退出（退出码 $rc）"
+  if [ "$rc" -ne 0 ]; then
+    # NapCat 启动阶段的报错常常只写进它自己的日志文件，stdout 上什么都没有
+    napcat_own_log_tail
+  fi
+  return "$rc"
+}
+
+# NapCat 自己的日志（NapCat 会把启动异常写进 logs/*.log，stdout 不一定有）
+napcat_own_log_tail() {
+  local f newest="" lines="${1:-20}"
+  for f in "$NAPCAT_DIR"/logs/*.log /opt/QQ/resources/app/app_launcher/napcat/logs/*.log; do
+    [ -f "$f" ] || continue
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
   done
-  if [ -n "$webui_port" ]; then
-    ok "NapCat 已启动，WebUI 端口：$webui_port"
-    info "扫码：bash $0 napcat-webui"
+  if [ -z "$newest" ]; then
+    info "（没有找到 NapCat 自己的日志文件）"
     return 0
   fi
-  err "NapCat 没能起来（WebUI 未监听），日志末尾："
-  webui_log_tail "$NAPCAT_LOG" 25
-  info "排查顺序：① 看日志里的「QQ 进程已退出，退出码」 ② 「安装 NapCat」重装依赖 ③ 执行 doctor 把输出发出来"
-  return 1
+  info "NapCat 自己的日志（$newest）末尾："
+  webui_log_tail "$newest" "$lines"
 }
 
 # 停 NapCat 本体（区分开：它不打印成功信息，方便内部复用）
@@ -1767,7 +2001,6 @@ napcat_stop_core() {
   pkill -f "QQ/qq" 2>/dev/null || true
   pkill -f "qq --no-sandbox" 2>/dev/null || true
   pkill -x qq 2>/dev/null || true
-  screen_drop "$XVFB_SCREEN"
   pkill -f "Xvfb :1" 2>/dev/null || true
   screen_wipe_dead
   return 0
@@ -2046,26 +2279,20 @@ adapter_status() {
   fi
 }
 
-# ---------- 服务器模式：全启 / 全停 / 自愈守护 ----------
+# ---------- 服务器模式 ----------
+# 注意：常驻服务由 **Termux 层** 管理（screen 会话托管 proot 进程，见脚本开头
+# Termux 层的说明）。下面几个函数只在你手动进容器执行时有意义：前台进程会随
+# 本次 login 退出被 proot 清掉，所以它们只给提示 + 尽力而为。
 
 allstart() {
   say ""
-  say "${BOLD}===== 启动全部服务 =====${NC}"
+  say "${BOLD}===== 启动全部服务（容器内前台模式）=====${NC}"
+  warn "容器里直接起的服务会随本次 login 退出被清理（proot login 带 --kill-on-exit）"
+  info "要后台常驻：请在 Termux 里执行 bash ~/maibot-onekey.sh guard，或用 App 的「一键启动全部」"
   local rc=0
-  if [ -f "$BOT_DIR/bot.py" ]; then
-    start || rc=1
-  else
-    warn "MaiBot 尚未部署（缺 $BOT_DIR/bot.py），已跳过"
-    info "请先在 App 点「按顺序安装：Debian → MaiBot」"
-    rc=1
-  fi
-  if [ -f "$NAPCAT_ENV" ]; then
-    napcat_start || rc=1
-  else
-    warn "NapCat 尚未配置 QQ 号，已跳过"
-    info "请先执行 napcat-install，再 napcat-setup <QQ号>"
-    rc=1
-  fi
+  if [ -f "$BOT_DIR/bot.py" ]; then start & else warn "MaiBot 尚未部署，已跳过"; rc=1; fi
+  if [ -f "$NAPCAT_ENV" ]; then napcat_start & else warn "NapCat 尚未配置 QQ 号，已跳过"; rc=1; fi
+  sleep 3
   return "$rc"
 }
 
@@ -2088,29 +2315,12 @@ reset_sessions() {
   info "接着点「启动 MaiBot」和「启动 NapCat」重新拉起即可"
 }
 
+# 容器内的守护只在你手动进容器跑时有用；App/常驻场景请用 Termux 层的 wd
 watchdog() {
-  local interval="${1:-60}"
   say ""
-  info "守护进程运行中：每 ${interval} 秒检查一次，掉线自动拉起"
-  local last_bot=0 last_nc=0 now
-  while true; do
-    now=$(date +%s 2>/dev/null || echo 0)
-    if [ -f "$BOT_DIR/bot.py" ] && ! is_running; then
-      if [ $((now - last_bot)) -ge 180 ]; then
-        warn "$(date '+%m-%d %H:%M:%S') MaiBot 掉线，自动拉起"
-        start
-        last_bot=$now
-      fi
-    fi
-    if [ -f "$NAPCAT_ENV" ] && ! napcat_running; then
-      if [ $((now - last_nc)) -ge 180 ]; then
-        warn "$(date '+%m-%d %H:%M:%S') NapCat 掉线，自动拉起"
-        napcat_start
-        last_nc=$now
-      fi
-    fi
-    sleep "$interval"
-  done
+  warn "守护进程现在跑在 Termux 层（bash ~/maibot-onekey.sh wd / App 的「一键启动全部」）"
+  info "容器内的进程会随本次 login 退出被清理，所以这里不再启动守护"
+  return 0
 }
 
 menu() {
@@ -2123,6 +2333,7 @@ menu() {
     say "  11)检查 12)安装 13)配置QQ 14)启动 15)停止 16)状态 17)登录码"
     say "  --- 服务器模式 ---"
     say "  18)启动全部 19)停止全部"
+    warn "容器内直接启动只会跑在本次 login 的前台；常驻请用 App 或在 Termux 执行 guard"
     say "  --- 连接检查 ---"
     say "  20)检测WebUI 21)配置适配器 22)适配器状态 23)连接诊断 24)修复依赖 25)清理残留 26)重装QQ 27)镜像测速"
     say "  0)退出"
@@ -2148,6 +2359,7 @@ case "$RUN_ACTION" in
   install)        install ;;
   update)         update ;;
   start)          start ;;
+  prepare-bot)    prepare_bot ;;
   fg)             fg_run ;;
   stop)           stop ;;
   restart)        restart ;;

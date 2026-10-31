@@ -7,10 +7,10 @@ RUN_TRACKED=0
 BOLD=; NC=
 err(){ :; }; warn(){ :; }; info(){ :; }; ok(){ :; }; say(){ :; }
 '@
-foreach ($name in @('update','sync_deps','webui_log_tail','start','logs','sync_napcat_config',
+foreach ($name in @('update','sync_deps','webui_log_tail','start','prepare_bot','logs','sync_napcat_config',
                     'maibot_port_open','napcat_port_open','screen_session_state','screen_session_running',
                     'screen_wipe_dead','screen_drop','maibot_process_running','stop_maibot',
-                    'qq_process_running','xvfb_running','ensure_xvfb','napcat_webui_port','napcat_start','allstart')) {
+                    'qq_process_running','xvfb_running','ensure_xvfb','napcat_own_log_tail','napcat_webui_port','napcat_start')) {
     $match = [regex]::Match($text, '(?ms)^' + $name + '\(\) \{.*?^\}')
     if (!$match.Success) { throw "Function not found: $name" }
     $test += "`n" + $match.Value + "`n"
@@ -66,25 +66,24 @@ grep -q 'PIPESTATUS' "$NAPCAT_DIR/start_qq.sh" || { echo 'FAIL: start_qq.sh lost
 grep -q -- '--no-sandbox' "$NAPCAT_DIR/start_qq.sh" || { echo 'FAIL: start_qq.sh lost --no-sandbox'; exit 1; }
 grep -q 'ulimit -c 0' "$NAPCAT_DIR/start_qq.sh" || { echo 'FAIL: start_qq.sh lost the core-dump guard'; exit 1; }
 echo 'PASS: generated NapCat launcher is valid and records the exit code'
-# A leftover Dead session (process gone, empty shell) must not stop start from
-# relaunching: the old code reported "already running" and the WebUI never came up.
+# A leftover Dead session (process gone, empty shell) must never be reported as
+# "already running": that was the bug where the start button did nothing at all.
 SCREEN_CALLS="$work/screen-calls"
 screen(){
   case "$1" in
     -ls) printf 'There are screens on:\n\t111.maibot\t(Dead ???)\n' ;;
-    -wipe) : ;;
-    -S) : ;;
-    -dmS) shift; echo "dmS $*" >> "$SCREEN_CALLS" ;;
     *) : ;;
   esac
 }
 : > "$SCREEN_CALLS"
 maibot_process_running(){ return 1; }
-start >/dev/null 2>&1
-grep -q 'dmS maibot' "$SCREEN_CALLS" || { echo 'FAIL: start did not relaunch over a dead session'; exit 1; }
-echo 'PASS: start reclaims a dead session and launches again'
-allstart && { echo 'FAIL: aggregate launch failure swallowed'; exit 1; }
-echo 'PASS: allstart propagates failures'
+out=$(start 2>&1) && { echo 'FAIL: dead session made start succeed'; exit 1; }
+echo "$out" | grep -q '已在运行' && { echo 'FAIL: dead session treated as already running'; exit 1; }
+echo 'PASS: start is not blocked by a dead session'
+# prepare_bot only syncs dependencies and must fail loudly when the source is missing.
+rm -f "$BOT_DIR/bot.py"
+prepare_bot && { echo 'FAIL: prepare_bot accepted a missing bot.py'; exit 1; }
+echo 'PASS: prepare_bot refuses to run without the source'
 '@
 $temp = Join-Path $env:TEMP ('maibot-regressions-' + [guid]::NewGuid().ToString('N') + '.sh')
 try {

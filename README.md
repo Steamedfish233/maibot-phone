@@ -11,6 +11,7 @@ App 不重做 MaiBot 的网页界面，只负责：把环境装好、把服务�
 > v2.0.4 诊断增强：输出 `screen -ls` 原始内容并标出 **Dead 会话**（进程早已退出、只剩空壳，这是「以前能用、现在不动」的典型现场），检查 `.venv` 里的 Python 是否可用、`uv.lock` 是否比 `.venv` 新（说明依赖没同步完）、代码最后一次更新时间、NapCat / QQ 是否还在、剩余磁盘空间。依赖同步改为 **阿里云 → 清华 → 官方 PyPI** 依次回退。
 > v2.0.5 修复「会话在、WebUI 打不开、点启动没反应」：**Dead 空壳会话不再算作"正在运行"**（旧版本会让「启动 MaiBot」「启动 NapCat」直接返回，守护和掉线重启也一起失效），启动前自动 `screen -wipe` 清理；MaiBot 改用 **虚拟环境解释器直接启动**（不再 `uv run`，避免每次都卡在 `Building maibot @ ...`）；NapCat 的 Xvfb 改为独立会话常驻，启动前清理 `/tmp/.X1-lock`，`ulimit -c 0` 防止 core 写满存储，并在日志里记录 **QQ 真实退出码/信号**（139 段错误、137 内存不足）；诊断新增 QQ 构建号（NapCat 要求 ≥40768）、缺失动态库、`/dev/shm`、Xvfb 日志与崩溃转储；修复 Termux 菜单新增「25)清理残留 26)重装QQ」。
 > v2.0.6 镜像连通性与界面顺序：安装前**逐个实测国内镜像**（Debian / PyPI / QQ CDN / GitHub 代理），不可达的直接跳过并在日志里说明，`apt`/`uv` 只在可用的源上重试；镜像候选扩到清华 / 阿里云 / 中科大 / 腾讯云 / 华为云 / 南大 / 上交，PyPI 增加腾讯云与华为云，新增 **Termux 菜单 27)镜像测速** 与诊断里的镜像可用性行；QQ 安装包换成 **官方 3.2.34-53644**（官方页面给的 3.2.18 地址已 404），已装 QQ 构建号低于 40768 时**自动重装**，NapCat 版本查询增加 GitHub 代理兜底；界面改为**安装优先**：首次安装向导与项目反馈提到最上面，服务状态 / WebUI / 适配器 / 保活居中，第 0-3 步与「打不开先点这里」在下方。
+> v2.0.7 **修掉「启动成功、一打开 WebUI 就报未运行」的根因**：`proot-distro login` 默认带 `--kill-on-exit`，login 一退出，本次 login 里启动的 screen / Xvfb / QQ / MaiBot 会被一起杀掉 —— 旧版本在容器里 `screen -dmS` 之后就让 login 退出，服务当然活不过那一次操作，容器里还留下一堆 Dead 空壳会话。现在改为**与 NapCat 官方 Termux 配方一致**：服务跑在本次 login 的前台，由 **Termux 侧的 screen 会话**托住整条 proot 进程链，停服务 = 结束该会话；守护进程也移到 Termux 层（App 被杀、容器重建都能自愈）。同时：NapCat 起不来时自动用 `NAPCAT_DISABLE_MULTI_PROCESS=1` 重试一次，失败会打印 **NapCat 自己的日志**与 QQ 退出码；修复被 `dpkg -i --force-depends` 弄坏的 apt 状态（`dpkg --configure -a` + `--fix-broken`，安装 QQ 改用 `apt` 解析依赖），新增回归测试 `verify-termux-services.ps1`。
 
 ## 功能
 
@@ -46,8 +47,20 @@ QQ → NapCat → 正向 WebSocket ws://127.0.0.1:3001 → 统一 QQ 连接器 �
 从 [Releases](../../releases) 或 `dist/` 目录下载 APK 安装：
 
 ```
-dist/MaiBot-OneKey-v2.0.6.apk
+dist/MaiBot-OneKey-v2.0.7.apk
 ```
+
+## 服务是怎么常驻的
+
+`proot-distro login` 默认带 `--kill-on-exit`：**这条命令一退出，本次 login 里启动的进程全部会被杀掉**。所以服务不能"在容器里 screen 一下就走"，必须跑在本次 login 的前台，再由 Termux 自己的 screen 会话托住整条 proot 进程链：
+
+```
+Termux screen 会话(maibot) ──> proot-distro login ──> .venv/bin/python bot.py
+Termux screen 会话(napcat) ──> proot-distro login ──> Xvfb :1 + qq --no-sandbox
+Termux screen 会话(maibot-watchdog) ──> 每 60s 探 8001/6099/3001，掉线自动拉起
+```
+
+停服务 = 结束对应的 Termux 会话（容器内进程由 proot 一并回收）。诊断输出的「Termux 层状态」看的就是这些会话；`live` 才是真在跑，`dead` 只剩空壳。
 
 ## 镜像与国内网络
 

@@ -5,15 +5,33 @@ $source = Join-Path $root 'MaibotApp/app/src/main/assets/maibot-onekey.sh'
 if (!(Test-Path -LiteralPath $source)) { throw "missing file: $source" }
 $text = [System.IO.File]::ReadAllText($source)
 
-# --- static checks: the start path must not rebuild dependencies on every launch ---
-if ($text -notmatch 'uv run --no-sync python bot\.py') {
-    throw 'start must keep a --no-sync fallback instead of a plain uv run'
+# --- static checks ---
+# Architecture (v2.0.7): proot-distro login carries --kill-on-exit, so a service
+# started in a container-side screen session dies the moment the login returns.
+# Services must instead run in the foreground of a login hosted by a Termux-side
+# screen session. These checks are what keeps that from silently regressing.
+if ($text -notmatch 'termux_service_start\(\)') { throw 'the Termux layer must own service startup' }
+if ($text -notmatch 'termux_service_stop\(\)') { throw 'the Termux layer must own service shutdown' }
+if ($text -notmatch 'termux_watchdog\(\)') { throw 'the watchdog must run in the Termux layer' }
+if ($text -notmatch 'termux_service_up\(\)') { throw 'the Termux layer must probe service ports' }
+if ($text -notmatch '\-\-kill-on-exit') { throw 'the kill-on-exit root cause must stay documented' }
+if ($text -match 'screen -dmS "\$SCREEN_NAME"') {
+    throw 'MaiBot must not be started in a container-side screen session (killed by --kill-on-exit)'
 }
-if ($text -match 'screen -dmS "\$SCREEN_NAME" bash -c "uv run --no-sync') {
-    throw 'start must not launch MaiBot through uv run: uv rebuilds the project and hangs on "Building ..."'
+if ($text -match 'screen -dmS "\$NAPCAT_SCREEN"') {
+    throw 'NapCat must not be started in a container-side screen session (killed by --kill-on-exit)'
 }
-if ($text -notmatch "\.venv/bin/python' -u bot\.py") {
-    throw 'start must launch MaiBot with the virtualenv interpreter'
+if ($text -notmatch '"\$py" -u bot\.py 2>&1 \| tee') {
+    throw 'start must run the bot in the foreground with the virtualenv interpreter'
+}
+if ($text -notmatch 'local py="\$BOT_DIR/\.venv/bin/python"') {
+    throw 'start must resolve the virtualenv interpreter'
+}
+if ($text -notmatch 'prepare-bot\)\s+prepare_bot') { throw 'prepare-bot action must be routed' }
+if ($text -notmatch 'NAPCAT_DISABLE_MULTI_PROCESS=1') { throw 'NapCat must retry in single-process mode' }
+if ($text -notmatch 'repair_dpkg_state\(\)') { throw 'a broken dpkg/apt state must be repaired' }
+if ($text -notmatch 'apt-get \$APT_OPTS install -y /tmp/linuxqq\.deb') {
+    throw 'the QQ deb must be installed through apt so its dependencies are resolved'
 }
 if ($text -notmatch '(?s)sync_deps\(\)\s*\{.*?uv sync --frozen.*?uv sync\b') {
     throw 'sync_deps must try the locked sync first and fall back'
@@ -24,13 +42,13 @@ if ($text -notmatch 'pypi\.tuna\.tsinghua\.edu\.cn') { throw 'dependency sync ne
 if ($text -notmatch "'Dead'") { throw 'doctor must spot dead screen sessions' }
 if ($text -notmatch 'screen_session_state\(\)') { throw 'a Dead screen session must be distinguished from a live one' }
 if ($text -notmatch 'screen -wipe') { throw 'dead sessions must be reclaimed with screen -wipe' }
-if ($text -notmatch 'ensure_xvfb\(\)') { throw 'Xvfb must be managed in its own session' }
+if ($text -notmatch 'ensure_xvfb\(\)') { throw 'Xvfb must be managed explicitly' }
 if ($text -notmatch '\$\{PIPESTATUS\[0\]\}') { throw 'the QQ launch must log the real exit code via PIPESTATUS' }
 if ($text -notmatch 'uv\.lock" -nt') { throw 'doctor must compare uv.lock against .venv' }
-Write-Host 'PASS: start syncs deps first and launches with the virtualenv interpreter'
-Write-Host 'PASS: fix-deps action routed; QQ process detection present'
+Write-Host 'PASS: services run in the foreground of Termux-hosted screen sessions'
+Write-Host 'PASS: no container-side screen launch survives for MaiBot or NapCat'
+Write-Host 'PASS: fix-deps / prepare-bot routed; QQ process detection present'
 Write-Host 'PASS: dead sessions are reclaimed instead of blocking start'
-Write-Host 'PASS: doctor reports dead sessions and unsynced dependencies'
 
 # ASCII-only on purpose: Windows PowerShell reads .ps1 as ANSI when there is no BOM,
 # so non-ASCII text in this file would break parsing.
@@ -56,13 +74,12 @@ foreach ($fn in @('screen_session_state','screen_session_running','screen_wipe_d
                   'napcat_webui_port','napcat_log_url','mirror_alive',
                   'webui_http_code','webui_http_ok','webui_log_tail','webui','webui_check','napcat_webui',
                   'adapter_plugin_dir','adapter_status')) {
-    $startMarker = "`n" + $fn + "() {"
-    $start = $text.IndexOf($startMarker)
-    if ($start -lt 0) { throw "function not found: $fn" }
-    $rest = $text.Substring($start + 1)
-    $next = [regex]::Match($rest.Substring($fn.Length), '(?m)^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{')
-    if (-not $next.Success) { throw "next function not found after: $fn" }
-    $harness += "`n" + $rest.Substring(0, $fn.Length + $next.Index) + "`n"
+    # Match exactly one function body (up to the closing brace in column 0).
+    # Matching "up to the next function" would also drag top-level assignments
+    # that happen to sit between two functions into the harness.
+    $m = [regex]::Match($text, '(?ms)^' + [regex]::Escape($fn) + '\(\) \{.*?^\}')
+    if (-not $m.Success) { throw "function not found: $fn" }
+    $harness += "`n" + $m.Value + "`n"
 }
 
 $harness += @'
